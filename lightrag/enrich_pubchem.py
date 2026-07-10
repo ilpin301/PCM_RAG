@@ -43,7 +43,20 @@ CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://localhost:9622")
-LIGHTRAG_KEY = os.environ.get("LIGHTRAG_API_KEY", "0972f90608b9b953493482d2f5ec446d")
+def _load_lightrag_key():
+    k = os.environ.get("LIGHTRAG_API_KEY")
+    if k:
+        return k
+    envf = SCRIPT_DIR / ".env"
+    if envf.exists():
+        for line in envf.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("LIGHTRAG_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise SystemExit("LIGHTRAG_API_KEY not set (env var or lightrag/.env)")
+
+
+LIGHTRAG_KEY = _load_lightrag_key()
 
 ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_BASE = "https://api.z.ai/api/coding/paas/v4"
