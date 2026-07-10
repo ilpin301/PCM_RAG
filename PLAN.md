@@ -1,0 +1,40 @@
+# Plan: OpenAlex enrichment of ref_text nodes in PCM_RAG
+_Locked via grill — by Claude + ilpin301_
+
+## Goal
+Append verified bibliographic facts from OpenAlex onto existing citation-stub entity nodes (`ref_text`) in the PCM_RAG LightRAG graph. These nodes currently hold only LLM paraphrases (author + year + topic; verified: 0 of 490 descriptions contain a DOI, and none contain exact titles). Enrichment turns each into a verified reference — real title, DOI, authors, venue, year, citation count, open-access PDF link — additive-only, idempotent, and reversible, following the same approved pattern as the PubChem enricher (`lightrag/enrich_pubchem.py`).
+
+## Approach
+1. **Enumerate candidates from the graphml file directly** (`lightrag/data/rag_storage/graph_chunk_entity_relation.graphml`) — NOT via the `/graphs` API, which silently caps results at `MAX_GRAPH_NODES=1000` (`networkx_impl.py:511`). Candidate set = all nodes with `entity_type == ref_text` (490) ∪ citation-shaped names under `entity_type == content` (regex: `(et al|reference \[|\(\d{4}\))` case-insensitive AND a 19xx/20xx year in the name; currently 4 nodes). Dedupe → ~494 candidates.
+2. **Extract stage** (glm-5.2 via z.ai coding endpoint, `asyncio.Semaphore(2)`, backoff on error 1305): batch ~20 nodes per call; from node name + description extract JSON `{first_author_surname, year, venue, title_guess, topic_keywords}`. If a batch response is truncated/unparseable, fall back to per-node calls for that batch. Nodes where extraction fails or lacks surname+year → recorded `unresolved`, skipped. Extracted year must validate as a 4-digit integer in 1900–2026 before being used in the search filter; otherwise the node is `unresolved`.
+3. **OpenAlex search** (`https://api.openalex.org`, `mailto=ilpin301@gmail.com` polite pool — approved by user; flat `sleep(0.15)` between requests, well under the 10 req/s limit): `GET /works?filter=publication_year:Y-1|Y|Y+1,raw_author_name.search:{surname}&search={title_guess + topic_keywords}&per-page=5`. Cache raw JSON per node to disk (`openalex_cache.json`) so re-runs are free. Extraction-stage LLM results are likewise persisted to `extract_cache.json` before use, so a crash or restart never re-burns LLM quota. All cache files are written atomically (write to `<file>.tmp`, then `os.replace`).
+4. **Judge-verify stage** (glm-5.2): judge receives node name + description + up to 5 candidate works (title, authors, venue, year, DOI) and must pick exactly ONE candidate or SKIP. HARD RULES enforced in code, not judge-overridable: (a) chosen candidate `publication_year` within ±1 of extracted year; (b) extracted first-author surname appears (case-insensitive) in candidate authorships. Any violation → treated as SKIP (`hard_rule_reject`) regardless of judge output. Venue is a soft signal only (citation abbreviations differ from OpenAlex venue names) — judge weighs it but it is not a hard rule.
+5. **Format block** (compact set — no abstract, no concepts: avoids description bloat and embedding skew): All OpenAlex-sourced strings (title, authors, venue) are sanitized before injection — `<!--`, `-->` and newlines stripped — so a hostile or malformed title can never break the delimited block. DOI is injected only if it starts with `https://doi.org/` (prefix prepended when the API returns a bare `10.x/...`; otherwise `none`). The open-access PDF URL is injected only if it starts with `http://` or `https://`; otherwise `none`. The as-of date is generated dynamically (`datetime.now().strftime('%Y-%m')`), never hardcoded.
+   ```
+   <!--OPENALEX_START-->
+   OpenAlex reference facts (W…): Title: "…". Authors: A, B, C et al. Venue: …. Year: …. DOI: https://doi.org/…. Cited by N (as of 2026-07). Open-access PDF: <url|none>. Source: OpenAlex W….
+   <!--OPENALEX_END-->
+   ```
+6. **Idempotent write**: per node — fresh read of the CURRENT description via `/graphs?label=<name>&max_depth=1&max_nodes=10` (single-node reads are count-independent: the seed node is always returned before the cap check); strip any existing OPENALEX block (DOTALL regex `<!--OPENALEX_START-->.*?<!--OPENALEX_END-->`); append the new block; `POST /graph/entity/edit` with `{entity_name, updated_data: {description}, allow_rename: false, allow_merge: false}` — this re-embeds the description into `entities_vdb`. Node gone/renamed → recorded `gone`, skipped. The PubChem block (`<!--PUBCHEM_START-->`) uses different markers, so the two enrichers never clobber each other.
+7. **Wrap as `lightrag/enrich_openalex.py`** with `--dry-run` / `--limit N` / `--refresh` flags; resumable: presence of an OPENALEX block in the fresh description = already enriched, skipped unless `--refresh`. SUMMARY counters: `enriched / skipped_judge / unresolved / hard_rule_reject / gone / already / error`. Early-abort guard: if the first 20 processed candidates yield 0 enriched, the script prints a loud warning (likely systemic extraction/judge failure) before continuing. All httpx clients `trust_env=False` (SOCKS system proxy workaround); `PYTHONIOENCODING=utf-8` + stdout reconfigure for Windows console.
+8. **Runner agent** `.claude/agents/pcm-OpenAlex-runner.md` (model haiku, tools Bash + Read), mirroring `pcm-PubChem-runner`: inputs `MODE=dry|full`, `LIMIT`, `REFRESH`; preconditions: LightRAG server UP and idle, `ZAI_API_KEY` set; never starts/stops Docker or ingest; relays SUMMARY; no blind retry on failure.
+9. **Verify after full run**: count OPENALEX blocks in graphml == `enriched` counter; spot-check 5 nodes via `/graphs`; run one hybrid query naming a cited reference to confirm the block surfaces in retrieval context.
+
+## Key decisions & tradeoffs
+- **Target = ref_text only (490 + 4 misfiled under content).** `person` (1442) rejected: names like "Huang Et Al." are unmatchable and wrong-author enrichment poisons the graph. `organization` (127) rejected: journal/university metadata has low PCM-query value.
+- **Match = extract → search → judge-verify.** No DOI or exact title exists in any node (verified against all 490), so direct ID lookup is impossible. Blind top-1 fulltext search rejected: topically-similar PCM papers make wrong-paper attachment likely — same poisoning class the PubChem plan's judge gate exists to prevent.
+- **Hard rules above the judge** (year ±1, surname-in-authorship) enforced in code so LLM hallucination cannot bypass them.
+- **Compact facts block; abstract excluded** — node descriptions already paraphrase content; injecting abstracts would bloat descriptions and skew their embeddings.
+- **`mailto` polite pool** with user's email (explicitly approved).
+- **Additive delimited block** — original LLM-written description text is never modified; enrichment is reversible by stripping blocks.
+- **`cited_by_count` is a snapshot** — date-stamped "as of YYYY-MM"; `--refresh` re-pulls current values.
+- **Infra inherited from the approved PubChem plan**: graphml enumeration (avoids the 1000-node `/graphs` cap), `/graph/entity/edit` write path (updates node in place — no orphan duplicates), fresh-read RMW (no lost updates), Semaphore(2) for z.ai concurrency limit, `trust_env=False`.
+
+## Risks / open questions
+- **Match rate unknown.** Paraphrased descriptions may under-specify the work; expect a meaningful unresolved fraction (estimate 20–40%). Unresolved refs are skipped and counted, never guessed — an unenriched node is the status quo, not a regression.
+- **Duplicate works**: two ref_text nodes citing the same paper get the same block on both nodes — harmless duplication, no dedup needed.
+- **Venue-name mismatch** between citation abbreviations and OpenAlex canonical names — handled as soft signal (judge), not hard rule.
+- **Batch extraction truncation** — mitigated by per-node fallback (step 2).
+
+## Out of scope
+- person / organization enrichment; abstracts and concepts injection; arXiv enricher; Shape 2 (query-time live tool); downloading OA PDFs; automatic coupling to future ingests (manual re-run policy, same as PubChem — new ref_text nodes from later ingests are picked up by simply re-running the script).

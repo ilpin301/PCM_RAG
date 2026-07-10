@@ -20,10 +20,10 @@ Set-Location F:\____IL_AI\PCM_RAG\lightrag
 docker compose stop     # REQUIRED — script writes the same storage files as the container
 Start-Process pwsh -ArgumentList "-NoProfile", "-File", "F:\____IL_AI\PCM_RAG\lightrag\ingest_resume.ps1" -WindowStyle Hidden
 # Monitor live:
-Get-Content F:\____IL_AI\PCM_RAG\lightrag\ingest_run.log -Wait -Tail 20
+Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
 ```
 
-Success = `EXITCODE=0` at the end of the log. The script auto-runs `docker compose start` afterwards (fails silently if Docker Desktop is down — check `docker ps` and start manually if needed).
+Success = `EXITCODE=0` at the end of the log. The script auto-runs `docker compose start` afterwards (fails silently if Docker Desktop is down — check `docker ps` and start manually if needed). Log file is deleted automatically on success.
 
 ## Inline run (small docs only)
 

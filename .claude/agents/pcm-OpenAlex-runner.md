@@ -48,6 +48,7 @@ main agent has put everything you need in the task prompt.
    Append flags per inputs: `--dry-run` if MODE=dry; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes.
    Run it from `F:\____IL_AI\PCM_RAG\lightrag`. Use a generous timeout (extraction + judge LLM calls are concurrency-capped at 2 and OpenAlex is throttled; allow up to 10 minutes — pass timeout 600000 to the Bash tool).
    A **full run** over ~460 refs takes FAR longer than any subagent wall-clock — a prior full run was killed ~22 min in and was nowhere near done. So for a full run: launch the command DETACHED in the background and poll its log file / caches rather than blocking on it. Explicitly tell the main agent in your report that a full FINISH may need the **main agent** to run the command directly in the background (outside this time-limited subagent) — you can start it and confirm progress, but you likely cannot see it through to completion.
+   Log file for background/detached runs: `F:\____IL_AI\PCM_RAG\lightrag\LOG\enrich_openalex.log`. Redirect stdout+stderr there when running detached. Delete the log file if the script exits with code 0 (success).
    Run ONLY ONE instance at a time.
    **Git-Bash quirk (NOT a bug):** under Git-Bash, `python` shows up as TWO `python.exe` processes (the launcher + its child) and BOTH inherit the redirected stdout, so the log output is DOUBLED — you will see two `[enumerate]` headers. This is cosmetic; it is NOT two competing runs. Do not panic and do not kill "the duplicate".
    To kill stray instances:
