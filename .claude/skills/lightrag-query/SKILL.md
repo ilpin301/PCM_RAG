@@ -5,14 +5,15 @@ description: Query the local LightRAG knowledge graph (GraphRAG over ingested do
 
 # LightRAG Query
 
-Server: http://localhost:9622 — API key header required: `X-API-Key: 0972f90608b9b953493482d2f5ec446d`
+Server: http://localhost:9622 — API key header required (stored in lightrag/.env as LIGHTRAG_API_KEY — never hardcode)
 
 Query with PowerShell (write JSON body to a temp file first to avoid quoting issues):
 
 ```powershell
+$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
 $body = '{"query":"USER QUESTION HERE","mode":"hybrid"}'
 $tmp = New-TemporaryFile; Set-Content $tmp $body -NoNewline
-curl.exe -s http://localhost:9622/query -H "Content-Type: application/json" -H "X-API-Key: 0972f90608b9b953493482d2f5ec446d" -d "@$tmp"
+curl.exe -s http://localhost:9622/query -H "Content-Type: application/json" -H "X-API-Key: $key" -d "@$tmp"
 ```
 
 Modes: `hybrid` (default, best), `local` (entity-focused), `global` (relationship/theme-focused), `naive` (plain vector search), `mix`.

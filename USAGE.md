@@ -7,7 +7,7 @@ GraphRAG knowledge base: documents go in, LightRAG builds a knowledge graph (ent
 | | PCM_RAG (this one) | Old RAG |
 |---|---|---|
 | Web UI / API | http://localhost:9622 | http://localhost:9621 |
-| API key (`X-API-Key`) | `0972f90608b9b953493482d2f5ec446d` | `c9137de6fbd580a7739f63008fbdb627` |
+| API key (`X-API-Key`) | `see lightrag/.env` | `see lightrag/.env` |
 | Folder | `F:\____IL_AI\PCM_RAG\lightrag` | `F:\____IL_AI\RAG\lightrag` |
 | Container | `pcm_rag-lightrag-1` | `lightrag-lightrag-1` |
 
@@ -35,7 +35,8 @@ Interactive API reference (all endpoints, try-it-out): **http://localhost:9622/d
 ## The direct way: API commands (PowerShell)
 
 ```powershell
-$h = @{'X-API-Key'='0972f90608b9b953493482d2f5ec446d'; 'Content-Type'='application/json'}
+$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+$h = @{'X-API-Key'=$key; 'Content-Type'='application/json'}
 
 # Health check
 Invoke-RestMethod http://localhost:9622/health -Headers $h
@@ -45,7 +46,7 @@ $body = '{"query":"YOUR QUESTION","mode":"hybrid"}'
 (Invoke-RestMethod http://localhost:9622/query -Method Post -Headers $h -Body $body).response
 
 # Upload a file (txt, md, text-based PDF)
-curl.exe -s -X POST http://localhost:9622/documents/upload -H "X-API-Key: 0972f90608b9b953493482d2f5ec446d" -F "file=@C:\path\to\document.pdf"
+curl.exe -s -X POST http://localhost:9622/documents/upload -H "X-API-Key: $key" -F "file=@C:\path\to\document.pdf"
 
 # Insert raw text
 $body = '{"text":"...content...","file_source":"note.txt"}'

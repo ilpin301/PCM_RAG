@@ -3,7 +3,7 @@ PCM_RAG — HOW TO USE (quick instruction)
 ================================================================
 
 Your knowledge base: LightRAG GraphRAG server, web UI + REST API at
-http://localhost:9622, API key: 0972f90608b9b953493482d2f5ec446d
+http://localhost:9622, API key: (stored in lightrag/.env as LIGHTRAG_API_KEY — never hardcode)
 
 ----------------------------------------------------------------
 1. WHAT MUST BE RUNNING
@@ -15,7 +15,8 @@ BEFORE ASKING QUESTIONS:
        cd F:\____IL_AI\PCM_RAG\lightrag
        docker compose up -d
      check: open http://localhost:9622 in browser, or:
-       curl.exe -s http://localhost:9622/health -H "X-API-Key: 0972f90608b9b953493482d2f5ec446d"
+       $key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+       curl.exe -s http://localhost:9622/health -H "X-API-Key: $key"
   3. Ollama (embeddings for query context lookup):
        check: curl.exe -s http://localhost:11434/api/version
 
@@ -41,7 +42,8 @@ WAY B — Claude Code (this project):
   Claude uses the lightrag-query skill automatically.
 
 WAY C — Direct API (PowerShell, works from any script):
-  $h = @{'X-API-Key'='0972f90608b9b953493482d2f5ec446d'; 'Content-Type'='application/json'}
+  $key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+  $h = @{'X-API-Key'=$key; 'Content-Type'='application/json'}
   $body = '{"query":"YOUR QUESTION","mode":"hybrid"}'
   (Invoke-RestMethod http://localhost:9622/query -Method Post -Headers $h -Body $body).response
 
@@ -62,7 +64,7 @@ Never ingest from other folders.
 Simple text PDFs: upload via Web UI (drag & drop) — server must be UP.
 
 Scanned / chart-heavy PDFs (full pipeline: MinerU + GLM vision):
-  In Claude Code say: "ingest the PDFs in IN folder into the rag"
+  In Claude Code say: "ingest the new PDFs in IN folder into the rag"
   (raganything-ingest skill does everything: stops docker, runs
    rag_ingest.py detached, monitors, restarts docker).
 
@@ -86,7 +88,7 @@ You don't need to connect another model for normal use.
 
 Any external tool/model/agent CAN use the RAG — it is a plain HTTP API:
   POST http://localhost:9622/query
-  headers: X-API-Key: 0972f90608b9b953493482d2f5ec446d
+  headers: X-API-Key: (stored in lightrag/.env as LIGHTRAG_API_KEY — never hardcode)
            Content-Type: application/json
   body:    {"query":"...","mode":"hybrid"}
 
