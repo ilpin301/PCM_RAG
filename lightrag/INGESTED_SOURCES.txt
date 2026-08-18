@@ -13,13 +13,11 @@ Experimental_and_numerical_investigation_of_Phase_Change_Material_PCM_heatsink_f
 Impact_of_the_phase_change_material_PCM_integration_on_the_mortars_thermal_inertia_The_rol.pdf   # slices PCM_Mortars_Thermal_Inertia-01-07/-08-13/-14-15; 01-07 repaired 2026-08-18
 #
 # --- ingested as slice families whose source PDF is no longer in IN\ (kept for the record) ---
+DoctorArbeit_GunnarBruns_PCMs.pdf                    # 116 pp, COMPLETE 2026-08-18: gap slices 001-002/007-012/114-116 added; remaining gaps are blank pages only
+MA_Athanasia_Piperidou_final.pdf                     # 90 pp, COMPLETE 2026-08-18: gap slice 01-04 added; remaining gaps are blank pages only
 Bachelorarbeit_FINAL_RW_final_260513_130841.pdf
 Cooling_Techniques_for_Photovoltaic_Systems_A_Comprehensive_Review_of_Phase_Change_Materia.pdf
 Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building_Envelopes_.pdf
 #
 # --- PARTIAL: do NOT treat as done ---
-# DoctorArbeit_GunnarBruns_PCMs.pdf
-#   116 pages; slices cover 003-006,013-023,025-034,035-051,053-069,071-086,087-095,097-099,101-113.
-#   Genuinely missing: pages 7-11 (body text) and 115-116 (CV/conference list). Source only in git HEAD.
-# MA_Athanasia_Piperidou_final.pdf
-#   90 pages; slices cover 05-07..90-90. Genuinely missing: pages 1, 3, 4. Source only in git HEAD.
+# (no PARTIAL documents outstanding)

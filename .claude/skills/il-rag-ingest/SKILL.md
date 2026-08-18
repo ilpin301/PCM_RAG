@@ -41,7 +41,8 @@ Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\LAST_FAILURE.txt -ErrorAction Sile
 store's own count before trusting a clean bill:
 
 ```powershell
-$fileCount = ((Get-Content F:\____IL_AI\PCM_RAG\lightrag\dataag_storage\kv_store_doc_status.json -Raw | ConvertFrom-Json).PSObject.Properties | Measure-Object).Count
+$fileCount = ((Get-Content F:\____IL_AI\PCM_RAG\lightrag\data
+ag_storage\kv_store_doc_status.json -Raw | ConvertFrom-Json).PSObject.Properties | Measure-Object).Count
 $apiCount  = (($docs.statuses.PSObject.Properties.Value) | Measure-Object).Count
 "file=$fileCount api=$apiCount"   # a positive difference = a hidden 'handling' doc
 ```
@@ -173,7 +174,8 @@ Repair the underlying doc:
 
 ```powershell
 # the stuck doc will NOT appear in GET /documents - get its id from the store file
-$full = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\dataag_storage\kv_store_doc_status.json -Raw | ConvertFrom-Json).PSObject.Properties |
+$full = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\data
+ag_storage\kv_store_doc_status.json -Raw | ConvertFrom-Json).PSObject.Properties |
         Where-Object { $_.Value.file_path -eq '<slice>.pdf' } | ForEach-Object { $_.Name }
 $body = @{ doc_ids = @($full) } | ConvertTo-Json -Compress
 Invoke-RestMethod http://localhost:9622/documents/delete_document -Method Delete -Headers $h -Body $body
@@ -226,5 +228,10 @@ Emit ONE end-of-run summary: files ingested, the four verification numbers, anyt
 - `import fitz` warns it is deprecated — use `import pymupdf` in new snippets; both ship in the venv.
 - Deleted source PDFs are usually still in git: `git show HEAD:FOUND/<name>.pdf > <scratchpad>/<name>.pdf`
   recovers one for page-count or gap classification without touching the worktree.
+- **Upload from PowerShell, never from bash.** `curl.exe -s -X POST .../documents/upload -F "file=@F:\...\x.pdf"`
+  run through the Bash tool returns an EMPTY response and uploads nothing — bash mangles the Windows
+  path in the `-F` argument, and the server never sees a file. The same command from PowerShell returns
+  `{"status":"success",...,"track_id":"upload_..."}`. An empty response body is the tell; always confirm
+  the doc count actually rose before waiting on a pipeline that was never given any work.
 - Foreground `sleep` is blocked by the harness. Wait with an `until`-loop in a `run_in_background`
   shell, which also satisfies the silent-monitoring rule.
