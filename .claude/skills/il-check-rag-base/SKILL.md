@@ -53,6 +53,19 @@ one invariant, is told **read-only, propose nothing, fix nothing**, and returns 
   `vdb_relationships.json` must trace to a live parent in `kv_store_text_chunks.json` /
   `kv_store_full_entities.json` / `kv_store_full_relations.json`. Report ids with no parent, and the
   reverse (parents with no vector).
+  Complementary second probe, also required:
+
+  ```powershell
+  $env:NO_PROXY='*'; & F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe F:\____IL_AI\PCM_RAG\lightrag\check_vectors.py
+  ```
+
+  Exit `0` = healthy, `3` = problems; one line per store with row count, matrix row count, nonfinite
+  count and zero count. The two probes see different damage and neither replaces the other: the
+  set-difference above finds records **missing** a vector or **stale** vectors whose parent is gone;
+  `check_vectors.py` finds vectors that **exist but are poisoned** (NaN / all-zero) or a matrix
+  **misaligned** with the record list. A corrupt embedding model returns all-zero vectors,
+  normalizing yields NaN, and one NaN poisons the whole nano-vectordb matrix at load time — retrieval
+  then silently returns nothing while every id still traces to a live parent. Run both.
 - **B — stuck / broken doc status.** In `kv_store_doc_status.json` (container STOPPED — see Step 0):
   anything in `handling`, `pending`, `processing`, or `failed`; every `dup-*` stub; docs present in
   `doc_status` but absent from `kv_store_full_docs.json` (and vice versa). Also diff the file's doc

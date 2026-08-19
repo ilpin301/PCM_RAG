@@ -203,6 +203,19 @@ deltas below prove work happened. Record the baseline BEFORE launching (`grep -c
 3. **Vector sanity** — all three `vdb_chunks.json`, `vdb_entities.json`, `vdb_relationships.json`
    exist, have mtimes AFTER the run start, and GREW. Byte-identical sizes = the run did nothing. Missing/stale vdb => queries
    return `[no-context]`; the run did not finish cleanly.
+   Then run `check_vectors.py` — mtime+size say nothing about POISONED vectors:
+
+   ```powershell
+   $env:NO_PROXY='*'; & F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe F:\____IL_AI\PCM_RAG\lightrag\check_vectors.py
+   ```
+
+   Exit `0` = healthy, `3` = problems. One line per store: row count, matrix row count, nonfinite
+   count, zero count. A corrupt embedding model returns all-zero vectors; normalizing those yields
+   NaN, and NaN poisons the WHOLE nano-vectordb matrix at load time — retrieval then silently returns
+   nothing while the ingest still exits 0. It also catches data/matrix row misalignment.
+   `ingest_resume.ps1` now runs this itself on the success path and folds a non-zero result into
+   `EXITCODE`, so a poisoned store KEEPS its log instead of having it deleted. The manual run above is
+   for ad-hoc checks and for verifying a repair.
 4. **One targeted query** per ingested doc via `lightrag-query`, asking something only that document
    answers. Answer must cite it.
 
