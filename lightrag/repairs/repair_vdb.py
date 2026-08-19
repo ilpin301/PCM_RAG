@@ -1,4 +1,4 @@
-"""Repair PCM_RAG vdb: embed graph entities/edges that have no vector, drop stale vectors.
+"""Repair PCM_RAG vdb: embed graph entities/edges and text chunks that have no vector, drop stale vectors.
 Container MUST be stopped. Dry run by default; pass --apply to write.
 """
 import base64, hashlib, json, os, sys, time, urllib.request, zlib
@@ -48,11 +48,18 @@ print("graph:", len(nodes), "nodes,", len(edges), "edges", flush=True)
 
 ent = NanoVectorDB(DIM, storage_file=BASE + "/vdb_entities.json")
 rel = NanoVectorDB(DIM, storage_file=BASE + "/vdb_relationships.json")
+chk = NanoVectorDB(DIM, storage_file=BASE + "/vdb_chunks.json")
 est = ent._NanoVectorDB__storage
 rst = rel._NanoVectorDB__storage
+cst = chk._NanoVectorDB__storage
 eids = set(d["__id__"] for d in est["data"])
 rids = set(d["__id__"] for d in rst["data"])
-print("vdb:", len(eids), "entities,", len(rids), "relations", flush=True)
+cids = set(d["__id__"] for d in cst["data"])
+print("vdb:", len(eids), "entities,", len(rids), "relations,", len(cids), "chunks", flush=True)
+
+with open(BASE + "/kv_store_text_chunks.json", encoding="utf-8") as f:
+    kvchunks = json.load(f)
+print("kv:", len(kvchunks), "chunks", flush=True)
 
 now = int(time.time())
 ent_new, ent_txt = [], []
@@ -75,17 +82,26 @@ for (s, t), a in edges.items():
     if a.get("file_path"): rec["file_path"] = a["file_path"]
     rel_new.append(rec); rel_txt.append(c)
 
+chk_new, chk_txt = [], []
+for i, a in kvchunks.items():
+    if i in cids: continue
+    c = (a.get("content", ""))[:CAP]
+    rec = {"__id__": i, "__created_at__": now, "content": c,
+           "full_doc_id": a.get("full_doc_id", ""), "file_path": a.get("file_path", "")}
+    chk_new.append(rec); chk_txt.append(c)
+
 stale_e = [d["__id__"] for d in est["data"] if d.get("entity_name") not in nodes]
 gk = set(edges)
 stale_r = [d["__id__"] for d in rst["data"]
            if (d.get("src_id"), d.get("tgt_id")) not in gk
            and (d.get("tgt_id"), d.get("src_id")) not in gk]
-print("TO ADD: entities", len(ent_new), " relations", len(rel_new))
-print("TO DROP: entities", len(stale_e), " relations", len(stale_r))
+stale_c = [d["__id__"] for d in cst["data"] if d["__id__"] not in kvchunks]
+print("TO ADD: entities", len(ent_new), " relations", len(rel_new), " chunks", len(chk_new))
+print("TO DROP: entities", len(stale_e), " relations", len(stale_r), " chunks", len(stale_c))
 if not APPLY:
     print("dry run; re-run with --apply"); sys.exit(0)
 
-for path in ("vdb_entities.json", "vdb_relationships.json"):
+for path in ("vdb_entities.json", "vdb_relationships.json", "vdb_chunks.json"):
     bak = BASE + "/" + path + ".bak"
     if not os.path.exists(bak):
         import shutil; shutil.copy2(BASE + "/" + path, bak); print("backup ->", bak, flush=True)
@@ -99,11 +115,19 @@ if rel_new:
     for r, v in zip(rel_new, embed(rel_txt)):
         r["vector"] = pack(v); r["__vector__"] = v
 
+if chk_new:
+    print("embedding chunks...", flush=True)
+    for r, v in zip(chk_new, embed(chk_txt)):
+        r["vector"] = pack(v); r["__vector__"] = v
+
 if stale_e: ent.delete(stale_e)
 if stale_r: rel.delete(stale_r)
+if stale_c: chk.delete(stale_c)
 if ent_new: ent.upsert(ent_new)
 if rel_new: rel.upsert(rel_new)
+if chk_new: chk.upsert(chk_new)
 print("saving...", flush=True)
-ent.save(); rel.save()
+ent.save(); rel.save(); chk.save()
 print("DONE entities", len(est["data"]), est["matrix"].shape,
-      "| relations", len(rst["data"]), rst["matrix"].shape)
+      "| relations", len(rst["data"]), rst["matrix"].shape,
+      "| chunks", len(cst["data"]), cst["matrix"].shape)
