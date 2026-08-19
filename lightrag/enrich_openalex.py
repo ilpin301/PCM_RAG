@@ -73,9 +73,34 @@ LLM_MODEL = "glm-5.2"
 OPENALEX = "https://api.openalex.org"
 MAILTO = "ilpin301@gmail.com"  # polite pool — approved by user
 
+
+def _load_openalex_key():
+    k = os.environ.get("OPENALEX_API_KEY")
+    if k:
+        return k
+    envf = SCRIPT_DIR / ".env"
+    if envf.exists():
+        for line in envf.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("OPENALEX_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+OPENALEX_API_KEY = _load_openalex_key()
+
 MARK_START = "<!--OPENALEX_START-->"
 MARK_END = "<!--OPENALEX_END-->"
 BLOCK_RE = re.compile(r"<!--OPENALEX_START-->.*?<!--OPENALEX_END-->", re.DOTALL)
+
+
+class SearchUnavailable(RuntimeError):
+	"""OpenAlex search could not be completed (rate-limited / transport failure).
+
+	Raised instead of returning an empty list so a failed search is never
+	cached as a legitimate "no hits" result.
+	"""
+
 
 # graphml attribute keys (verified): d0=entity_id, d1=entity_type, d2=description
 K_TYPE = "d1"
@@ -302,6 +327,8 @@ async def openalex_search(client, ext, search_cache, name):
         "per-page": 5,
         "mailto": MAILTO,
     }
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
     works = []
     for attempt in range(4):
         await _throttle()
@@ -334,6 +361,8 @@ async def openalex_search(client, ext, search_cache, name):
                 "oa_url": oa.get("oa_url") or "",
             })
         break
+    else:
+        raise SearchUnavailable(f"OpenAlex search exhausted retries for {name!r}")
     search_cache[name] = works
     _save_json(SEARCH_CACHE, search_cache)
     return works

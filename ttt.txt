@@ -1,0 +1,20 @@
+run pubchem enrich, dry-run, limit 10
+--------------------------------------------------------------------------------------------------
+verify enriched nodes in the graph
+--------------------------------------------------------------------------------------------------
+
+ingest the new PDFs in IN folder into the rag
+run pubchem enrich full
+run openalex enrich full
+
+--------------------------------------------------------------------------------------------------
+
+
+grill me on the OpenAlex enricher, then GLM-review it
+
+Build an OpenAlex enricher like the PubChem one" (and later the same for arXiv)
+
+
+ok, stop the process at this point. Remember all important info for next sessions run
+
+remember isuue with port number for future RAG sessions

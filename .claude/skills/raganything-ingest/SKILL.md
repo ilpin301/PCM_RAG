@@ -23,6 +23,26 @@ Start-Process pwsh -ArgumentList "-NoProfile", "-File", "F:\____IL_AI\PCM_RAG\li
 Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
 ```
 
+### Self-terminating watch (for the Monitor tool — bash)
+
+`tail -f` never exits, so the monitor idles until timeout. Use this poll loop instead — it exits on EXITCODE, or when the log is deleted (which the script does on success):
+
+```bash
+cd /f/____IL_AI/PCM_RAG/lightrag
+until [ -f LOG/ingest_run.log ]; do sleep 2; done
+n=0
+while :; do
+  if [ -f LOG/ingest_run.log ]; then
+    tail -n +$((n+1)) LOG/ingest_run.log | grep -E "EXITCODE|Traceback|RetryError|FAILED|Killed|OOM|Error:"
+    n=$(wc -l < LOG/ingest_run.log)
+    grep -q EXITCODE LOG/ingest_run.log && break
+  else
+    echo "EXITCODE=0 (log deleted on success)"; break
+  fi
+  sleep 5
+done
+```
+
 Success = `EXITCODE=0` at the end of the log. The script auto-runs `docker compose start` afterwards (fails silently if Docker Desktop is down — check `docker ps` and start manually if needed). Log file is deleted automatically on success.
 
 ## Inline run (small docs only)

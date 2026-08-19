@@ -6,8 +6,11 @@ $env:MINERU_DEVICE_MODE='cuda'
 $env:TIKTOKEN_CACHE_DIR='C:\Users\il720506\AppData\Local\Temp\data-gym-cache'
 $env:ZAI_API_KEY = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=').Line.Split('=',2)[1].Trim()
 $pdfs = @(
-  "F:\____IL_AI\PCM_RAG\IN\PCM_Mortars_Thermal_Inertia-01-07.pdf"
+  # filled in per run by the il-rag-ingest skill; must be non-empty before launching
 )
+if ($pdfs.Count -eq 0) { throw "ingest_resume.ps1: `$pdfs is empty - populate it before running" }
+$missing = @($pdfs | Where-Object { -not (Test-Path $_) })
+if ($missing) { throw "ingest_resume.ps1: missing PDF(s): $($missing -join ', ')" }
 & F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe rag_ingest.py @pdfs `
   *>> F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log
 $ec = $LASTEXITCODE
