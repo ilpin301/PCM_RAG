@@ -8,6 +8,12 @@ $env:TIKTOKEN_CACHE_DIR='C:\Users\il720506\AppData\Local\Temp\data-gym-cache'
 $env:ZAI_API_KEY = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=').Line.Split('=',2)[1].Trim()
 $pdfs = @(
   # filled in per run by the il-rag-ingest skill; must be non-empty before launching
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-01-05.pdf',
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-05-07.pdf',
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-07-08.pdf',
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-08-10.pdf',
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-10-15.pdf',
+  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-15-19.pdf'
 )
 if ($pdfs.Count -eq 0) { throw "ingest_resume.ps1: `$pdfs is empty - populate it before running" }
 $missing = @($pdfs | Where-Object { -not (Test-Path $_) })

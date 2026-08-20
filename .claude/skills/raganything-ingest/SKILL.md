@@ -83,11 +83,19 @@ Any edit to the script must preserve all four.
 
 ## Kill/restart is safe and cheap
 
-- Parse cache + text-phase LLM cache persist after each call — re-runs replay them free.
+- Parse cache persists after each call — a re-run skips MinerU entirely (log shows `Parsing (native):`).
+- The LLM response cache only replays free **if the run was checkpointed** — LightRAG writes
+  `kv_store_llm_response_cache.json` at pipeline end only, so an uncheckpointed crash loses every
+  extraction since launch. See "Long runs: checkpointing" below.
+- After a successful ingest the response cache is deleted by the cleanup rule, so the NEXT re-run of
+  that same document pays full extraction again. Kill/restart is cheap mid-run, not after success.
 - Multimodal VLM descriptions may NOT hit cache — expect those to re-run.
 - **VDB files (`vdb_*.json`) only exist after a clean `EXITCODE=0` finish.** A killed run can leave them missing → queries return `[no-context]`. Fix: run ingest to clean completion.
 - Killed runs leave `dup-*` FAILED stubs in doc status and can leave real docs stuck in `handling`. Cleanup (server MUST be stopped for direct file edit): fix `"handling"` → `"processed"` and delete `dup-*` entries in `data\rag_storage\kv_store_doc_status.json`, or delete stubs via API:
   `Invoke-RestMethod http://localhost:9622/documents/delete_document -Method Delete -Headers $h -Body '{"doc_ids":["dup-XXXX"]}'` (header `X-API-Key` + `Content-Type: application/json`).
+  - **Prefer deleting the partial doc over flipping its status.** Flipping `handling` -> `processed`
+    marks a half-ingested document as complete and its missing chunks never come back. Delete it via
+    `DELETE /documents/delete_document`, sweep orphaned vectors, then re-ingest.
 
 ## Notes
 
@@ -96,3 +104,117 @@ Any edit to the script must preserve all four.
 - Ollama must be up before ANY ingest: `curl.exe -s http://localhost:11434/api/version`.
 - Verify afterwards with lightrag-status skill (documents should appear PROCESSED), then test one query.
 - If rag_ingest.py is missing, tell the user setup step 5 of F:\____IL_AI\PCM_RAG\INSTALL.md is incomplete.
+
+## Long runs: checkpointing and the serial-fallback trap
+
+Both failure modes below were hit on 2026-08-20 during a 282-item multimodal insert. This skill drives
+the same `rag_ingest.py` path, so both apply here.
+
+**Checkpointing is mandatory.** LightRAG persists `kv_store_llm_response_cache.json` only at the end
+of the pipeline. Verified: 61 cache saves logged while the on-disk mtime sat unmoved for 54 minutes.
+`rag_ingest.py` runs `periodic_cache_flush(rag, every=300)` as a background task, cancelled in a
+`finally`. Confirm it is wired before launching:
+
+```sh
+grep -n 'periodic_cache_flush\|flusher' rag_ingest.py
+```
+
+Once live, the log prints `--- llm cache flushed to disk` every 5 minutes and the cache file's mtime
+advances. If it does not, stop and fix that before burning hours of extraction.
+
+**The serial-fallback trap.** A brief internet drop does not just retry — one `APITimeoutError`
+aborts the async batch multimodal pass, and RAG-Anything restarts the multimodal phase from item 1,
+SERIALLY, without async concurrency. Signature:
+
+```
+ERROR: Error in multimodal processing: RetryError[C[111/282]: chunk-...: APITimeoutError]
+WARNING: Falling back to individual multimodal processing
+INFO: Processing item 1/282: page_footnote content
+```
+
+Nothing is lost — the text phase is already committed — but the serial path measured **2.7 min/item**
+(~12 h for 282 items). Do not let it grind. Confirm the endpoint is back
+(`curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' --max-time 15 https://api.z.ai/api/paas/v4/`
+returning 401 means reachable), kill the run, delete the partial `handling` doc, and relaunch to get
+the batch path back.
+
+**Arm waiters on the fallback line, not only on `EXITCODE=`** — otherwise a waiter sits silently
+through the entire 12-hour crawl:
+
+```sh
+until grep -qE 'Falling back to individual multimodal processing|EXITCODE=' LOG/<run>.log; do sleep 60; done
+```
+
+**Sweep orphaned vectors after any delete.** `DELETE /documents/delete_document` strands entity
+vectors on every delete, not just after crashes — observed 278, 275, then 272 across three deletes,
+each exactly the `vdb_entities` minus graph-node gap. With the container stopped:
+
+```sh
+python repairs/repair_vdb.py            # dry run: expect TO ADD 0/0/0
+python repairs/repair_vdb.py --apply    # writes .bak for all three stores first
+python check_vectors.py                 # entity rows must equal graph nodes
+```
+
+**Benign warning, do not chase it.** `LLM output format error; found 3/4 fields on ENTITY ...` means
+the model emitted a near-miss tuple delimiter (e.g. `<|# |>` instead of `<|#|>`), so the record split
+short. `_handle_single_entity_extraction` returns `None` — the record is dropped whole, nothing
+partial or corrupt is written. Measured rate 0.12% (5 of 4043 entities, 6 of ~5000 relations). Only
+investigate if it climbs past a few percent.
+
+## Keep the machine awake (mandatory)
+
+Any long-running RAG shell process — ingest, parse, insert, delete, enrich, audit — must run with sleep blocked, or the box suspends mid-run and the job dies.
+
+Start this BEFORE launching the process:
+
+```powershell
+$ka = Start-Process pwsh -ArgumentList '-NoProfile','-File','F:\____IL_AI\PCM_RAG\lightrag\keepawake.ps1' -PassThru -WindowStyle Hidden
+```
+
+Verify it registered (needs an elevated shell to read):
+
+```powershell
+powercfg /requests | Select-String -Pattern 'SYSTEM:' -Context 0,2
+```
+
+Expect `SYSTEM: [PROCESS] ...pwsh.exe`. If it says `None.`, the block is NOT active — do not start the run.
+
+`keepawake.ps1` holds `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_AWAYMODE_REQUIRED)` for as long as it lives, so killing the process releases the block automatically — there is no persistent power setting to restore. Display sleep is deliberately still allowed; only system sleep is blocked.
+
+Stop it as part of the cleanup below, once no RAG process is still running:
+
+```powershell
+Stop-Process -Id $ka.Id -Force
+```
+
+Gotcha: PowerShell parses `0x80000000` as a signed Int32, so building the flags inline throws on the P/Invoke and the keepawake silently does nothing while still looking alive. Use the script, which casts to `[uint32]`.
+
+## Cleanup after success (mandatory)
+
+When the run finishes SUCCESSFULLY — `EXITCODE=0` and the verification steps passed — do both of these before reporting done:
+
+1. **Kill every shell process started for this run.** Background waiters, `tail -f` tails, monitors, poll loops, and the `keepawake.ps1` process — the user's and yours. Use `TaskStop` on each background task id. Leave nothing running.
+2. **Delete the logs the run produced.** `ingest_run.log`, `LOG/*.log` for this run, and any scratchpad task-output files.
+
+Order matters: kill the tails BEFORE deleting the logs, or a live `tail -f` holds the handle.
+
+NEVER do either of these before success. While a run is in flight the log is the only evidence of progress, and on a FAILED or killed run both the logs and the shells must be KEPT for diagnosis.
+
+**Delete the LLM response cache.** Only after `EXITCODE=0` AND every verification step has passed:
+
+```sh
+docker stop pcm_rag-lightrag-1     # never delete while the server holds its own in-memory copy
+rm data/rag_storage/kv_store_llm_response_cache.json
+```
+
+LightRAG recreates the file empty on the next run. This is deliberate, not housekeeping: the cache
+exists so a crashed or interrupted run can be replayed without paying for extraction twice, and once
+a run has succeeded and verified there is nothing left to replay. It reached ~69 MB / 35k extraction
+entries on PCM_RAG before the first cleanup.
+
+Accepted cost: re-ingesting that document later pays full LLM extraction again, and the first queries
+after cleanup run cold while the query-mode cache refills.
+
+**Never delete it on failure, and never before verification.** A killed run's cache is the only thing
+that makes the relaunch cheap — that is the whole point of [[project_ingest_cache_flush]]. Deleting
+early converts a 15-minute relaunch into a full re-extraction.

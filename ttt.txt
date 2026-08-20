@@ -17,4 +17,4 @@ Build an OpenAlex enricher like the PubChem one" (and later the same for arXiv)
 
 ok, stop the process at this point. Remember all important info for next sessions run
 
-remember isuue with port number for future RAG sessions
+Look at this conversation and check if you've added everything you need to all rag skills to avoid and fix all issues.

@@ -3,6 +3,9 @@
 # IN\ against /documents does not see the source as already done. il-rag-ingest Step 1 reads this;
 # Step 7 appends to it. One filename per line; '#' comments and blank lines ignored.
 #
+# --- ingested WHOLE as ONE document via ingest_merged.py (no slice seams) ---
+Enhancement_of_the_Phase_Transition_Enthalpy_Clinoptilolite.pdf        # 19 pp, ONE doc 2026-08-19, 91 chunks, parsed in 2 slices then merged
+#
 # --- ingested as renamed slice families (source PDF still sits in IN\) ---
 Electromechanical_Hysteresis_in_Phase_Change_Material_Sb2S3.pdf          # slices Electromechanical_Hysteresis_Sb2S3-01-10/-11-20/-21-30
 Enhancing_PV_Panel_Performance_with_Different_Types_of_Phase_Change_Material_PCM_An_Experi.pdf   # slices Enhancing_PV_Panel_PCM-01-07/-08-12/-13-14
@@ -13,7 +16,7 @@ Experimental_and_numerical_investigation_of_Phase_Change_Material_PCM_heatsink_f
 Impact_of_the_phase_change_material_PCM_integration_on_the_mortars_thermal_inertia_The_rol.pdf   # slices PCM_Mortars_Thermal_Inertia-01-07/-08-13/-14-15; 01-07 repaired 2026-08-18
 #
 # --- ingested as slice families whose source PDF is no longer in IN\ (kept for the record) ---
-DoctorArbeit_GunnarBruns_PCMs.pdf                    # 116 pp, COMPLETE 2026-08-18: gap slices 001-002/007-012/114-116 added; remaining gaps are blank pages only
+DoctorArbeit_GunnarBruns_PCMs.pdf                    # 116 pp, RE-INGESTED WHOLE 2026-08-20 as ONE merged document (doc-ef4f9e9561ffb6c07f5b77ffbcac9168, 322 chunks) via ingest_merged.py; the 12 slice-docs and their 11 seams were deleted first. Supersedes the 2026-08-18 slice-based COMPLETE entry.
 MA_Athanasia_Piperidou_final.pdf                     # 90 pp, COMPLETE 2026-08-18: gap slice 01-04 added; remaining gaps are blank pages only
 Bachelorarbeit_FINAL_RW_final_260513_130841.pdf
 Cooling_Techniques_for_Photovoltaic_Systems_A_Comprehensive_Review_of_Phase_Change_Materia.pdf

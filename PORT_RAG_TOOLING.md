@@ -190,3 +190,18 @@ future port in either direction should not treat them as missing on the far side
 Deliberately NOT backported: MECH's `-ListFile` / `ingest_list.txt` mechanism. It defends against ANSI
 codepage mangling of non-ASCII filenames passed as process args; PCM's filenames are all ASCII, so that
 failure cannot occur. Port it to PCM only if non-ASCII source filenames ever show up there.
+
+## Periodic LLM cache flush (port this)
+
+LightRAG persists `kv_store_llm_response_cache.json` only at pipeline end, so any multi-hour ingest
+loses all extraction work on a crash. PCM_RAG fixes this with `periodic_cache_flush(rag, every=300)`
+in `lightrag/rag_ingest.py` — an `asyncio.create_task` started before the ingest loop and cancelled
+in a `finally`, calling `rag.lightrag.llm_response_cache.index_done_callback()`.
+
+Port it to every RAG base that runs long ingests. It needs no new dependency and touches only the
+two entry points (`main()` and any merged-insert equivalent). Verify with
+`grep -n 'periodic_cache_flush' rag_ingest.py` and by watching for `--- llm cache flushed to disk`
+in the run log.
+
+While porting, also carry over `repairs/repair_vdb.py` — `delete_document` strands orphaned entity
+vectors on every delete, not just after crashes.

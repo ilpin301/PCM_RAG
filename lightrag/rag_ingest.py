@@ -145,6 +145,27 @@ embedding_func = EmbeddingFunc(
 )
 
 
+async def periodic_cache_flush(rag, every=300):
+    """Flush the LLM response cache to disk every `every` seconds.
+
+    LightRAG only persists kv_store_llm_response_cache.json at the end of the
+    pipeline, so a crash mid-run loses every extraction since launch. Bounds the
+    loss to `every` seconds instead.
+    """
+    # ponytail: flushes only the LLM response cache, not doc_status/text_chunks;
+    # widen if a crash is ever seen to lose more than re-runnable extraction work
+    while True:
+        await asyncio.sleep(every)
+        lr = getattr(rag, "lightrag", None)
+        if lr is None:
+            continue
+        try:
+            await lr.llm_response_cache.index_done_callback()
+            print("--- llm cache flushed to disk", flush=True)
+        except Exception as e:
+            print(f"--- llm cache flush failed: {e}", flush=True)
+
+
 async def main(paths):
     config = RAGAnythingConfig(
         working_dir=WORKING_DIR,
@@ -160,14 +181,18 @@ async def main(paths):
         vision_model_func=vision_model_func,
         embedding_func=embedding_func,
     )
-    for path in paths:
-        print(f"--- ingesting {path}")
-        await rag.process_document_complete(
-            file_path=path,
-            output_dir=os.path.join(os.path.dirname(WORKING_DIR), "mineru_output"),
-            parse_method="auto",
-        )
-        print(f"--- done {path}")
+    flusher = asyncio.create_task(periodic_cache_flush(rag))
+    try:
+        for path in paths:
+            print(f"--- ingesting {path}")
+            await rag.process_document_complete(
+                file_path=path,
+                output_dir=os.path.join(os.path.dirname(WORKING_DIR), "mineru_output"),
+                parse_method="auto",
+            )
+            print(f"--- done {path}")
+    finally:
+        flusher.cancel()
 
 
 if __name__ == "__main__":
