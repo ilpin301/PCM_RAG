@@ -29,7 +29,12 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** none started. Update this line as segments complete — it is what a fresh session reads first.
+**Status:** **S0 done** (2026-08-24). PCM `281af8a`, MECH `5c027e8`. Both trees have zero tracked
+changes; MECH retains a 60-path untracked backlog that predates this work. Deviation from the plan
+text: the RAG stores are no longer versioned at all — `lightrag/data/rag_storage/` was untracked and
+gitignored in MECH on the user's instruction ("don't commit RAG bases themselves, only things for
+creating and using a correct base; base backed up in Google"). PCM already ignored its store. Next: S1.
+Update this line as segments complete — it is what a fresh session reads first.
 
 | Seg | What | Covers | Depends on | Size |
 |---|---|---|---|---|
