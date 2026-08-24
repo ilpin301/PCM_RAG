@@ -5,6 +5,9 @@
 #
 # --- ingested WHOLE as ONE document via ingest_merged.py (no slice seams) ---
 Enhancement_of_the_Phase_Transition_Enthalpy_Clinoptilolite.pdf        # 19 pp, ONE doc 2026-08-19, 91 chunks, parsed in 2 slices then merged
+Inverse_designed_resistive_heaters_for_uniform_switching_of_Phase_Change_Materials.pdf  # 14 pp, ONE doc 2026-08-21, MinerU route, ingested via ingest_merged.py --pages 7
+Multi-PCM_Lime_Mortars_Incorporating_Polymer-Shell_and_Form-Stable_Phase_Change_Materials_.pdf  # 44 pp, ONE doc 2026-08-21, MinerU route, ingest_merged.py --pages 7 (7 slices), 143 chunks; hit serial multimodal fallback mid-run, completed anyway
+Optimization_of_Phase_Change_Material_Integration_for_Active_Cooling_Control.pdf  # 8 pp, ONE doc 2026-08-24, MinerU route, ingest_merged.py --pages 7 (2 slices); 21 equations / 12 charts / 2 tables all recognized and verified in store
 #
 # --- ingested as renamed slice families (source PDF still sits in IN\) ---
 Electromechanical_Hysteresis_in_Phase_Change_Material_Sb2S3.pdf          # slices Electromechanical_Hysteresis_Sb2S3-01-10/-11-20/-21-30

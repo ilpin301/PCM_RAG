@@ -8,17 +8,12 @@ $env:TIKTOKEN_CACHE_DIR='C:\Users\il720506\AppData\Local\Temp\data-gym-cache'
 $env:ZAI_API_KEY = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=').Line.Split('=',2)[1].Trim()
 $pdfs = @(
   # filled in per run by the il-rag-ingest skill; must be non-empty before launching
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-01-05.pdf',
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-05-07.pdf',
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-07-08.pdf',
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-08-10.pdf',
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-10-15.pdf',
-  'F:\____IL_AI\PCM_RAG\IN\Clino_Enthalpy_ov-15-19.pdf'
+  'F:\____IL_AI\PCM_RAG\IN\Optimization_of_Phase_Change_Material_Integration_for_Active_Cooling_Control.pdf'
 )
 if ($pdfs.Count -eq 0) { throw "ingest_resume.ps1: `$pdfs is empty - populate it before running" }
 $missing = @($pdfs | Where-Object { -not (Test-Path $_) })
 if ($missing) { throw "ingest_resume.ps1: missing PDF(s): $($missing -join ', ')" }
-& F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe rag_ingest.py @pdfs `
+& F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe ingest_merged.py $pdfs[0] --pages 7 `
   *>> F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log
 $ec = $LASTEXITCODE
 # an ingest can exit 0 while writing NaN / all-zero vectors (corrupt embedding model);
