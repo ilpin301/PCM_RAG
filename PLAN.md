@@ -29,39 +29,36 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** **S4 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `bb38cf8`, PCM at `1f74103`,
-MECH at `a8b505f`. Both bases still hold their original launchers, python and project skill folders -
-nothing has been moved or deleted, and no base has changed behaviour.
+**Status:** **S5 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `bb38cf8`, PCM at `88e4b92`
+plus the S5 bookkeeping commit, MECH at `a8b505f`. **PCM_RAG now runs ONLY through the kit.** MECH is
+untouched and still runs on `ingest_detached.ps1` - that is S6.
 
-**The owed plan edit is now applied**, in two places: Phase 0 step 3 is marked SUPERSEDED (MECH's 13
-`rag_storage` files were untracked and gitignored, not committed; 1535 MB of orphan LFS objects
-pruned, `.git` 1.9 GB -> 172 MB), and Phase 3 step 17 gained a "Revised after S0" clause requiring
-the store to stay ignored and making that a separate assertion from the ledger becoming tracked.
+Deleted from PCM (all recoverable from `88e4b92^`): `lightrag\ingest_resume.ps1`, `rag_ingest.py`,
+`ingest_merged.py`, `check_vectors.py`, `ingest_triage.py`, and all six folders under
+`.claude\skills\` - project skills shadow global ones, so they had to go for the kit's skills to take
+effect at all. One deviation beyond the plan's list: `lightrag\ingest_detached.ps1` was deleted too,
+a stale one-off that called the now-deleted `rag_ingest.py` and ingested straight out of `FOUND\`,
+violating the ingest-only-from-IN rule. `CLAUDE.md` and `RAG-use-instruction.txt` rewritten against
+the new entrypoint.
 
-S4 evidence: MECH `lightrag\INGESTED_SOURCES.txt` seeded from `kv_store_doc_status.json` with the
-container stopped - 47 docs all `processed`, `IN\` holds exactly those 47 files 1:1, 15 ledger rows
-(13 self-named + the two slice-family sources from `FOUND\`). `git check-ignore -v` shows the ledger
-matched by its `!` rule and `CLAUDE.md` matched by nothing (exit 1), while both store files are still
-ignored by `lightrag/.gitignore:59`. Root `CLAUDE.md` written and tracked.
+S5 evidence: PCM `.claude\` holds only `agents\` and `settings.local.json`; `lightrag\` retains only
+`enrich_openalex.py`, `enrich_pubchem.py`, `keepawake.ps1`, `setup.py`; the six global skills resolve
+to the kit. A second acceptance ingest ran with no local tooling present -
+`The_Effect_of_Phase_Change_Material_PCM..._Tubular_Solar_Di.pdf`, 8 pages, ~56 min, `EXITCODE=0`:
+docs 66 -> 67 (37 chunks), nodes 27573 -> 27960, edges 86176 -> 87624, all three vdb grown,
+`check_vectors.py` exit 0 with entity rows == graph nodes and relationship rows == graph edges
+exactly, and a targeted query returned the paper with its authors, DOI and measured numbers.
 
-Recorded in the ledger comments rather than glossed: TM2 Theorie is 309 pages with 293 sliced pages
-ingested and pages 1-14 absent; TM3 Theorie is 343 pages with 328 ingested and ~15 unreconciled,
-because the `-4-`/`-5-`/`-7-` slice families are numbered chapter-relative. Both are listed as done
-anyway - re-ingesting either whole source would duplicate everything else - with the caveat written
-down. Technische Mechanik 1 Aufgabenbuch and Theorie are in `FOUND\` and NOT ingested; the third TM1
-file cannot be opened by pymupdf.
+**The `--- llm cache flushed to disk` open item is CLOSED.** Sampled mid-run rather than after:
+10 flushes over a 56-minute run, one per ~5 minutes, matching `periodic_cache_flush(rag, every=300)`.
+Step 24 stays unverifiable *after* a successful run - the launcher deletes the log on `EXITCODE=0` -
+so the criterion must be checked live, which is now proven to work.
 
-S3 sound check closed: the user confirmed hearing both wavs.
+Also learned: `rag_sync.ps1 push` must run from a native PowerShell. Under Git Bash `tar` resolves to
+the msys build, which reads `C:\...` as a remote host and fails with `Cannot connect to C: resolve
+failed`. A fresh 705 MB snapshot was pushed at 08:02 before the deletions.
 
-S1-S3 deviations still in force: `RAGBASE_ROOT` env var only, shared `ragbase.py`, downloaded
-tiktoken seed, `* -text`, only `cleanup_processed_slices.ps1` adopted from `repairs`, six SKILL.md
-files assembled from three shared fragments, skills installed as junctions, `RAGKIT_HOME` at User
-scope only, `COMPOSE_PROJECT_NAME` now mandatory.
-
-Known open item, unchanged: plan step 24 asks to confirm `--- llm cache flushed to disk` in the run
-log, but the launcher deletes the log on `EXITCODE=0`. Check it mid-run or drop the criterion.
-
-Next: S5 - cut PCM over (delete its launcher, the copied-out python, its six project skill folders).
+Next: S6 - cut MECH over and prove it with one small MECH ingest.
 Update this line as segments complete — it is what a fresh session reads first.
 
 | Seg | What | Covers | Depends on | Size |
