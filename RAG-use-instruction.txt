@@ -65,15 +65,21 @@ Simple text PDFs: upload via Web UI (drag & drop) — server must be UP.
 
 Scanned / chart-heavy PDFs (full pipeline: MinerU + GLM vision):
   In Claude Code say: "ingest the new PDFs in IN folder into the rag"
-  (raganything-ingest skill does everything: stops docker, runs
-   rag_ingest.py detached, monitors, restarts docker).
+  (il-rag-ingest skill does everything: routing, slicing, launching the
+   ragkit launcher detached, waiting, verifying, bookkeeping).
 
-  Manual alternative:
-    1. edit PDF list in F:\____IL_AI\PCM_RAG\lightrag\ingest_resume.ps1
-    2. cd F:\____IL_AI\PCM_RAG\lightrag ; docker compose stop
-    3. Start-Process pwsh -ArgumentList "-NoProfile","-File","F:\____IL_AI\PCM_RAG\lightrag\ingest_resume.ps1" -WindowStyle Hidden
-    4. watch: Get-Content F:\____IL_AI\PCM_RAG\lightrag\ingest_run.log -Wait -Tail 20
-    5. success = EXITCODE=0 at end of log; docker restarts automatically.
+  Manual alternative — this base has NO launcher of its own any more;
+  everything runs through the shared kit at %RAGKIT_HOME%:
+    1. write the PDF paths, one per line, UTF-8, into
+       F:\____IL_AI\PCM_RAG\lightrag\ingest_list.txt
+    2. Start-Process pwsh -ArgumentList "-NoProfile","-File","$env:RAGKIT_HOME\ingest.ps1",
+         "-Root","F:\____IL_AI\PCM_RAG","-ListFile","F:\____IL_AI\PCM_RAG\lightrag\ingest_list.txt" -WindowStyle Hidden
+       (the launcher stops docker itself — do NOT stop it first)
+    3. watch: Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
+    4. success = EXITCODE=0, the log is deleted, Ring10.wav plays and docker
+       restarts automatically. Failure = the log is kept as
+       ingest_FAILED_<stamp>.log, LAST_FAILURE.txt holds the triage verdict,
+       and Windows Critical Stop.wav plays.
 
   Verify after: ask "did ingestion finish?" in Claude Code
   (lightrag-status skill) — documents must show PROCESSED.
@@ -106,7 +112,8 @@ Full interactive API reference: http://localhost:9622/docs
 ----------------------------------------------------------------
 
   - Ollama must be UP before any ingest (silent embedding failures otherwise).
-  - Container must be STOPPED during rag_ingest.py runs.
+  - Container must be STOPPED during rag_ingest.py runs. The kit launcher
+    does this for you; never run the python directly.
   - Never change the embedding model (bge-m3) — old vectors become garbage.
   - Ingest interrupted? Safe. Re-run — caches make it cheap. But queries
     only work after a run finishes cleanly (EXITCODE=0).
