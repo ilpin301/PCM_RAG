@@ -29,38 +29,39 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** **S3 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at commit `bb38cf8`. Both bases
-still hold their original launchers, python and project skill folders - nothing moved or deleted yet.
+**Status:** **S4 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `bb38cf8`, PCM at `1f74103`,
+MECH at `a8b505f`. Both bases still hold their original launchers, python and project skill folders -
+nothing has been moved or deleted, and no base has changed behaviour.
 
-S3 found and fixed a real bug the two-base testing could never have caught: a base with no
-`COMPOSE_PROJECT_NAME` in its `.env` makes docker compose derive the project from the compose file's
-parent folder, which is `lightrag` for EVERY base. The scratch base resolved to `lightrag-lightrag-1`,
-an unrelated project. `ingest.ps1` now refuses to run without the key (guard placed before the docker
-stop) and Discovery throws the same way. Both existing bases already set it.
+**The owed plan edit is now applied**, in two places: Phase 0 step 3 is marked SUPERSEDED (MECH's 13
+`rag_storage` files were untracked and gitignored, not committed; 1535 MB of orphan LFS objects
+pruned, `.git` 1.9 GB -> 172 MB), and Phase 3 step 17 gained a "Revised after S0" clause requiring
+the store to stay ignored and making that a separate assertion from the ledger becoming tracked.
 
-S3 evidence: all 8 launcher guards fire against a scratch base the code had never seen, with no
-container touched; `check_vectors.py` on the empty scratch store gives exit 3 with three `missing`
-after successfully reading `EMBEDDING_DIM=768` from the scratch `.env`; `ingest_merged.py --self-test`
-passes there and `PYTHONPATH` correctly falls through to the venv `lightrag_hku` for a base with no
-vendored package. A deliberate failure through the launcher produced `EXITCODE=1`, a kept
-`ingest_FAILED_<stamp>.log`, `LAST_FAILURE.txt` with verdict `MINERU_PARSE_FAILED`, and a trailing
-`docker compose start`. The PCM acceptance ingest of a 7-page paper ran ~48 min and gave `EXITCODE=0`,
-docs 65 -> 66 (all processed, 44 chunks), nodes 27201 -> 27573, edges 84744 -> 86176, all three vdb
-files grown with fresh mtimes, `check_vectors.py` exit 0 with `vdb_entities` rows == graph nodes and
-`vdb_relationships` rows == graph edges exactly, and one targeted hybrid query returning the new
-paper with authors and table detail. Ledger gained its row.
+S4 evidence: MECH `lightrag\INGESTED_SOURCES.txt` seeded from `kv_store_doc_status.json` with the
+container stopped - 47 docs all `processed`, `IN\` holds exactly those 47 files 1:1, 15 ledger rows
+(13 self-named + the two slice-family sources from `FOUND\`). `git check-ignore -v` shows the ledger
+matched by its `!` rule and `CLAUDE.md` matched by nothing (exit 1), while both store files are still
+ignored by `lightrag/.gitignore:59`. Root `CLAUDE.md` written and tracked.
 
-Two gaps, deliberately left: the `--- llm cache flushed to disk` line could NOT be confirmed - the
-launcher deletes the log on `EXITCODE=0`, so the acceptance criterion in step 24 is unverifiable as
-written. And whether the wavs were audible is the user's to confirm; the code path ran without error.
+Recorded in the ledger comments rather than glossed: TM2 Theorie is 309 pages with 293 sliced pages
+ingested and pages 1-14 absent; TM3 Theorie is 343 pages with 328 ingested and ~15 unreconciled,
+because the `-4-`/`-5-`/`-7-` slice families are numbered chapter-relative. Both are listed as done
+anyway - re-ingesting either whole source would duplicate everything else - with the caveat written
+down. Technische Mechanik 1 Aufgabenbuch and Theorie are in `FOUND\` and NOT ingested; the third TM1
+file cannot be opened by pymupdf.
 
-S1/S2 deviations still in force: `RAGBASE_ROOT` env var only (no `--root` flag), shared `ragbase.py`,
-downloaded tiktoken seed, `* -text`, only `cleanup_processed_slices.ps1` adopted from `repairs`, six
-SKILL.md files assembled from three shared fragments, skills installed as junctions (`-Dev`),
-`RAGKIT_HOME` set at User scope only.
+S3 sound check closed: the user confirmed hearing both wavs.
 
-Next: S4 - MECH wiring (ledger, CLAUDE.md, gitignore). **Read the owed plan edit below first:** the
-no-bases-in-git rule invalidates the Phase 3 step that assumed MECH tracks store files.
+S1-S3 deviations still in force: `RAGBASE_ROOT` env var only, shared `ragbase.py`, downloaded
+tiktoken seed, `* -text`, only `cleanup_processed_slices.ps1` adopted from `repairs`, six SKILL.md
+files assembled from three shared fragments, skills installed as junctions, `RAGKIT_HOME` at User
+scope only, `COMPOSE_PROJECT_NAME` now mandatory.
+
+Known open item, unchanged: plan step 24 asks to confirm `--- llm cache flushed to disk` in the run
+log, but the launcher deletes the log on `EXITCODE=0`. Check it mid-run or drop the criterion.
+
+Next: S5 - cut PCM over (delete its launcher, the copied-out python, its six project skill folders).
 Update this line as segments complete — it is what a fresh session reads first.
 
 | Seg | What | Covers | Depends on | Size |
@@ -143,9 +144,12 @@ derivable at runtime; the fifth is pinned per base via `PYTHONPATH` rather than 
    currently also holds untracked `.obsidian/`, `FOUND/no-ENG/` and a stray `IN/*.pdf` that must
    NOT be swept in. Add `.obsidian/` to `.gitignore`.
 3. Commit MECH_RAG's dirty tree as-is (`chore: checkpoint before ragkit port`). This includes
-   modified `lightrag/data/rag_storage/*` and deleted `FOUND/` PDFs. Deliberately **not** fixing
-   the fact that MECH tracks 13 rag_storage files in git (`.git` is already 259 MB) — out of scope,
-   recorded as a follow-up. Enumerate files there too — `git add -A` would sweep unrelated
+   modified `lightrag/data/rag_storage/*` and deleted `FOUND/` PDFs.
+   **SUPERSEDED at execution time (S0, 2026-08-24).** The user set a standing rule: git tracks the
+   RAG *tooling*, never the bases - the stores live on Drive. So MECH's 13 `rag_storage` files were
+   untracked and gitignored instead of committed, and 1535 MB of orphan LFS objects were pruned
+   (`.git` 1.9 GB -> 172 MB). PCM already ignored its store. The files stay on disk; only git stops
+   carrying them. Every later step that assumed MECH tracks store files is void. Enumerate files there too — `git add -A` would sweep unrelated
    untracked paths into the repo permanently.
 
 ### Phase 0b — machine-portability contract
@@ -346,6 +350,11 @@ earlier is fine; running it earlier installs nothing.
     created in the following steps are untracked by default. Add `!/lightrag/INGESTED_SOURCES.txt`
     explicitly, and confirm with `git check-ignore -v` that both it and the new root `CLAUDE.md`
     are tracked. An unversioned ledger silently loses the re-ingest guard.
+    **Revised after S0:** the store itself must STAY ignored. The `!/lightrag/data/` whitelist line
+    is only there so tracked files under `data\` remain reachable; it must never re-admit
+    `data/rag_storage/`, which the trailing `/lightrag/data/rag_storage/` rule excludes. Verify with
+    `git check-ignore -v` on one store file that it is still ignored - the ledger becoming tracked
+    and the store staying ignored are two separate assertions and both must hold.
 18. Seed `MECH_RAG\lightrag\INGESTED_SOURCES.txt` from what MECH has already ingested: read
     `kv_store_doc_status.json` `file_path` values **with the container stopped** (the JSON is stale
     while it is up) and map each back to its original source name. Never copy PCM's rows.
