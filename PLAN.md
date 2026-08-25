@@ -29,26 +29,38 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** **S2 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at commit `76e262e`; S1 was
-`4e47bfa`. Both bases still run on their original launchers and their own project skill folders,
-which still shadow the global ones - nothing has been moved or deleted.
+**Status:** **S3 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at commit `bb38cf8`. Both bases
+still hold their original launchers, python and project skill folders - nothing moved or deleted yet.
 
-S1 deviations, still in force: (a) the python takes its base from the `RAGBASE_ROOT` env var only,
-set by `ingest.ps1 -Root`; no per-script `--root` flag, and a shared `ragbase.py` holds the
-root/storage/.env resolution. (b) the tiktoken seed was downloaded, not copied - `%TEMP%` had none.
-(c) `.gitattributes` sets `* -text`; CRLF corrupts the seed. (d) only `cleanup_processed_slices.ps1`
-was adopted from `repairs\*.ps1`.
+S3 found and fixed a real bug the two-base testing could never have caught: a base with no
+`COMPOSE_PROJECT_NAME` in its `.env` makes docker compose derive the project from the compose file's
+parent folder, which is `lightrag` for EVERY base. The scratch base resolved to `lightrag-lightrag-1`,
+an unrelated project. `ingest.ps1` now refuses to run without the key (guard placed before the docker
+stop) and Discovery throws the same way. Both existing bases already set it.
 
-S2 deviations: (e) the six skills share three assembly fragments (`skills\_discovery.md`,
-`_run_discipline.md`, `_cache_cleanup.md`) that are concatenated into each SKILL.md; bootstrap
-installs directories only, so the fragments are never installed. (f) skills were installed as
-DIRECTORY JUNCTIONS (`bootstrap.ps1 -Dev`), so `~\.claude\skills\<name>` and the kit are the same
-files on this machine. (g) `RAGKIT_HOME` is set at User scope but NOT in this session - a Claude
-restart is needed before the skills can resolve it. (h) bootstrap overwrites a same-named global
-skill folder; if untracked global copies of these six names existed before, they were replaced. The
-project copies under each base are intact and were the content source.
+S3 evidence: all 8 launcher guards fire against a scratch base the code had never seen, with no
+container touched; `check_vectors.py` on the empty scratch store gives exit 3 with three `missing`
+after successfully reading `EMBEDDING_DIM=768` from the scratch `.env`; `ingest_merged.py --self-test`
+passes there and `PYTHONPATH` correctly falls through to the venv `lightrag_hku` for a base with no
+vendored package. A deliberate failure through the launcher produced `EXITCODE=1`, a kept
+`ingest_FAILED_<stamp>.log`, `LAST_FAILURE.txt` with verdict `MINERU_PARSE_FAILED`, and a trailing
+`docker compose start`. The PCM acceptance ingest of a 7-page paper ran ~48 min and gave `EXITCODE=0`,
+docs 65 -> 66 (all processed, 44 chunks), nodes 27201 -> 27573, edges 84744 -> 86176, all three vdb
+files grown with fresh mtimes, `check_vectors.py` exit 0 with `vdb_entities` rows == graph nodes and
+`vdb_relationships` rows == graph edges exactly, and one targeted hybrid query returning the new
+paper with authors and table detail. Ledger gained its row.
 
-Next: S3 - prove the new path on a scratch base plus one small PCM ingest.
+Two gaps, deliberately left: the `--- llm cache flushed to disk` line could NOT be confirmed - the
+launcher deletes the log on `EXITCODE=0`, so the acceptance criterion in step 24 is unverifiable as
+written. And whether the wavs were audible is the user's to confirm; the code path ran without error.
+
+S1/S2 deviations still in force: `RAGBASE_ROOT` env var only (no `--root` flag), shared `ragbase.py`,
+downloaded tiktoken seed, `* -text`, only `cleanup_processed_slices.ps1` adopted from `repairs`, six
+SKILL.md files assembled from three shared fragments, skills installed as junctions (`-Dev`),
+`RAGKIT_HOME` set at User scope only.
+
+Next: S4 - MECH wiring (ledger, CLAUDE.md, gitignore). **Read the owed plan edit below first:** the
+no-bases-in-git rule invalidates the Phase 3 step that assumed MECH tracks store files.
 Update this line as segments complete — it is what a fresh session reads first.
 
 | Seg | What | Covers | Depends on | Size |

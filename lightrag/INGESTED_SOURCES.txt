@@ -26,5 +26,6 @@ Cooling_Techniques_for_Photovoltaic_Systems_A_Comprehensive_Review_of_Phase_Chan
 Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building_Envelopes_.pdf
 #
 Performance_Enhancement_of_Phase_Change_Material_PCM_Thermal_Energy_Storage_TES_System_Usi.pdf
+Phase_change_materials_PCMs_for_building_energy_efficiency_A_review.pdf
 # --- PARTIAL: do NOT treat as done ---
 # (no PARTIAL documents outstanding)
