@@ -29,7 +29,7 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** **S8 done** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `41d51e6`, PCM at `a42396f`, MECH at `615f8a0`. Both bases run only through the kit; runbook rewritten, portability grep clean, caches cleaned, snapshots refreshed. Only S7 (MECH integrity audit, open-ended) is left.
+**Status:** **DONE - S0 through S8 complete** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `41d51e6`, PCM at `b34260e`, MECH at `615f8a0`. Both bases run only through the kit. S7 audit found no damage in MECH: 48/48 processed, zero orphaned vectors, snapshot identical, baseline recorded in MECH project memory.
 plus the S5 bookkeeping commit, MECH at `a8b505f`. **PCM_RAG now runs ONLY through the kit.** MECH is
 untouched and still runs on `ingest_detached.ps1` - that is S6.
 
