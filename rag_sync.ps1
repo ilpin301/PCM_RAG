@@ -49,8 +49,10 @@ if (-not $KeepRunning) {
     }
 
     if (Get-Command docker -ErrorAction SilentlyContinue) {
-        $container = @(docker ps -a --filter 'name=lightrag' --format '{{.Names}}')[0]
-        if (-not $container) { $container = "$($project.ToLower())-lightrag-1" }
+        # A bare name=lightrag filter matches every base's container and would stop an
+        # unrelated project's server. Pin to this base's own COMPOSE_PROJECT_NAME.
+        $cpn = Select-String -Path (Join-Path $PSScriptRoot 'lightrag\.env') -Pattern '^\s*COMPOSE_PROJECT_NAME\s*=\s*(\S+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $container = if ($cpn) { "$($cpn.Matches[0].Groups[1].Value.ToLower())-lightrag-1" } else { "$($project.ToLower())-lightrag-1" }
         $wasRunning = [bool](@(docker ps --filter "name=^$container$" --format '{{.Names}}')[0])
         if ($wasRunning) {
             "stopping $container ..."
