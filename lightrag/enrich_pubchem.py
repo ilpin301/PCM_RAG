@@ -42,7 +42,7 @@ GRAPHML = SCRIPT_DIR / "data" / "rag_storage" / "graph_chunk_entity_relation.gra
 CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 
-LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://localhost:9622")
+LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 def _load_lightrag_key():
     k = os.environ.get("LIGHTRAG_API_KEY")
     if k:

@@ -48,7 +48,7 @@ EXTRACT_CACHE = CACHE_DIR / "extract_openalex.json"
 JUDGE_CACHE = CACHE_DIR / "judge_openalex.json"
 SEARCH_CACHE = CACHE_DIR / "search_openalex.json"
 
-LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://localhost:9622")
+LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 
 
 def _load_lightrag_key():

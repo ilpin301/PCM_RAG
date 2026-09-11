@@ -31,10 +31,13 @@ main agent has put everything you need in the task prompt.
 
 ## Procedure (do these in order)
 
-1. **Preconditions.** Run, from `F:\____IL_AI\PCM_RAG\lightrag`:
+1. **Preconditions.** Run, from `X:\RAG_MAIN\PCM_RAG\lightrag`:
    - Server health:
-     `$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim(); curl.exe -s http://localhost:9622/health -H "X-API-Key: $key"`
+     `$key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim(); curl.exe -s http://127.0.0.1:9622/health -H "X-API-Key: $key"`
      If it does not return a healthy/OK JSON, STOP and report "server not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
+   - Qdrant health (vectors live in Qdrant since the 2026-09-09 migration; LightRAG can be up while Qdrant is down, and the entity edit then fails mid-run at the vector upsert):
+     `curl.exe -s http://127.0.0.1:6333/readyz`
+     If it does not return a ready response, STOP and report "qdrant not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
    - ZAI key: check the env var is set: `if [ -z "$ZAI_API_KEY" ]; then echo MISSING; fi`
      If MISSING, STOP and report that `ZAI_API_KEY` must be set before running. You cannot set it.
    - Remind (in your final report, not a blocker you can verify): a real (`full`) run needs the pipeline IDLE — no ingest running.
@@ -42,7 +45,7 @@ main agent has put everything you need in the task prompt.
 2. **Build the command.** Base:
    `NO_PROXY='*' python enrich_pubchem.py`
    Append flags per inputs: `--dry-run` if MODE=dry; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes.
-   Run it from `F:\____IL_AI\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; allow up to 10 minutes — pass timeout 600000 to the Bash tool). If it is a large `full` run that may exceed that, run it in the background and redirect output to `F:\____IL_AI\PCM_RAG\lightrag\LOG\enrich_pubchem.log`; delete the log file if the script exits with code 0.
+   Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; allow up to 10 minutes — pass timeout 600000 to the Bash tool). If it is a large `full` run that may exceed that, run it in the background and redirect output to `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_pubchem.log`; delete the log file if the script exits with code 0.
 
 3. **Capture + interpret.** The script prints per-node lines (`[enriched]`, `[skipped_judge]`, `[unresolved]`, `[gone]`, `[already]`, `[error]`) and ends with an `==== SUMMARY ====` block of counts plus `candidates:` / `compounds:`. Read those counts.
 

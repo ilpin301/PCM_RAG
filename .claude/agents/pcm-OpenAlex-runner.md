@@ -33,29 +33,25 @@ main agent has put everything you need in the task prompt.
 
 ## Procedure (do these in order)
 
-1. **Preconditions.** Run, from `F:\____IL_AI\PCM_RAG\lightrag`:
+1. **Preconditions.** Run, from `X:\RAG_MAIN\PCM_RAG\lightrag`:
    - Server health:
-     `$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim(); curl.exe -s http://localhost:9622/health -H "X-API-Key: $key"`
+     `$key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim(); curl.exe -s http://127.0.0.1:9622/health -H "X-API-Key: $key"`
      If it does not return a healthy/OK JSON, STOP and report "server not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
-   - **Docker Desktop daemon must be running.** If `curl http://localhost:9622/health` fails to connect (curl exit / http 000) AND `docker ps` errors with "cannot connect to the Docker API / daemon not running", the Docker Desktop daemon is down. STOP and report: "Docker Desktop not running — the main agent should start it (`C:\Program Files\Docker\Docker\Docker Desktop.exe`), wait for the daemon, then `docker compose up -d` in lightrag/." Do NOT start Docker yourself.
-   - **Ollama must be running (REQUIRED for writes).** Check `curl -s http://localhost:11434/api/tags` returns JSON listing `bge-m3:latest`. If Ollama is DOWN, every `/graph/entity/edit` write returns HTTP 500 with server-side `ConnectionError: Failed to connect to Ollama` — because the write path re-embeds the updated node text via bge-m3 at host.docker.internal:11434. READS work without Ollama; only WRITES need it, so a dry-run can pass while a full run 500s on every node. STOP a full run and report if Ollama is down (main agent starts `C:\Users\il720506\AppData\Local\Programs\Ollama\ollama app.exe`). Do NOT start Ollama yourself.
-   - ZAI key: read from `.env` and export:
+   - Qdrant health (vectors live in Qdrant since the 2026-09-09 migration; LightRAG can be up while Qdrant is down, and the entity edit then fails mid-run at the vector upsert):
+     `curl.exe -s http://127.0.0.1:6333/readyz`
+     If it does not return a ready response, STOP and report "qdrant not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
+   - **Docker Desktop daemon must be running.** If `curl http://127.0.0.1:9622/health` fails to connect (curl exit / http 000) AND `docker ps` errors with "cannot connect to the Docker API / daemon not running", the Docker Desktop daemon is down. STOP and report: "Docker Desktop not running — the main agent should start it (`C:\Program Files\Docker\Docker\Docker Desktop.exe`), wait for the daemon, then `docker compose up -d` in lightrag/." Do NOT start Docker yourself.
+   - **Ollama must be running (REQUIRED for writes).** Check `curl -s http://127.0.0.1:11434/api/tags` returns JSON listing `bge-m3:latest`. If Ollama is DOWN, every `/graph/entity/edit` write returns HTTP 500 with server-side `ConnectionError: Failed to connect to Ollama` — because the write path re-embeds the updated node text via bge-m3 at host.docker.internal:11434. READS work without Ollama; only WRITES need it, so a dry-run can pass while a full run 500s on every node. STOP a full run and report if Ollama is down (main agent starts `C:\Users\il720506\AppData\Local\Programs\Ollama\ollama app.exe`). Do NOT start Ollama yourself.
+   - ZAI key: read from `.env` (READ-ONLY — never write, append, or rotate any key, and never hardcode a key literal anywhere):
      ```powershell
-     $zai = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=').Line.Split('=',2)[1].Trim()
-     if (-not $zai) {
-         # GUARD: only append ZAI_API_KEY if not already present. Use Add-Content (append-only). Never use Set-Content or rewrite the file. Never touch LIGHTRAG_API_KEY or any other key.
-         $already = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=')
-         if (-not $already) {
-             Add-Content F:\____IL_AI\PCM_RAG\lightrag\.env "`nZAI_API_KEY=***REMOVED***"
-         }
-         $zai = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^ZAI_API_KEY=').Line.Split('=',2)[1].Trim()
-     }
-     $env:ZAI_API_KEY = $zai
+     $hit = Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^(ZAI_API_KEY|LLM_BINDING_API_KEY)=' | Select-Object -First 1
+     if (-not $hit) { throw "no z.ai key in .env" }
+     $env:ZAI_API_KEY = $hit.Line.Split('=',2)[1].Trim()
      ```
-     The main agent does NOT need to pass `ZAI_API_KEY` — this subagent reads/writes it from `.env` automatically.
+     Precedence matches `ingest.ps1`: `ZAI_API_KEY` wins, `LLM_BINDING_API_KEY` is the fallback. If NEITHER is present, STOP and report that a z.ai key must be added to `.env` before running. You cannot add it yourself.
    - OpenAlex API key: read from `.env` and export (read-only — never write or rotate this key):
      ```powershell
-     $oakey = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^OPENALEX_API_KEY=').Line.Split('=',2)[1].Trim()
+     $oakey = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^OPENALEX_API_KEY=').Line.Split('=',2)[1].Trim()
      if ($oakey) { $env:OPENALEX_API_KEY = $oakey }
      ```
      The script reads this automatically; exporting here is a belt-and-suspenders fallback.
@@ -71,9 +67,9 @@ main agent has put everything you need in the task prompt.
 2. **Build the command.** Base:
    `NO_PROXY='*' python enrich_openalex.py`
    Append flags per inputs: `--dry-run` if MODE=dry; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes.
-   Run it from `F:\____IL_AI\PCM_RAG\lightrag`. Use a generous timeout (extraction + judge LLM calls are concurrency-capped at 2 and OpenAlex is throttled; allow up to 10 minutes — pass timeout 600000 to the Bash tool).
+   Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (extraction + judge LLM calls are concurrency-capped at 2 and OpenAlex is throttled; allow up to 10 minutes — pass timeout 600000 to the Bash tool).
    A **full run** over ~460 refs takes FAR longer than any subagent wall-clock — a prior full run was killed ~22 min in and was nowhere near done. So for a full run: launch the command DETACHED in the background and poll its log file / caches rather than blocking on it. Explicitly tell the main agent in your report that a full FINISH may need the **main agent** to run the command directly in the background (outside this time-limited subagent) — you can start it and confirm progress, but you likely cannot see it through to completion.
-   Log file for background/detached runs: `F:\____IL_AI\PCM_RAG\lightrag\LOG\enrich_openalex.log`. Redirect stdout+stderr there when running detached. Delete the log file if the script exits with code 0 (success).
+   Log file for background/detached runs: `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_openalex.log`. Redirect stdout+stderr there when running detached. Delete the log file if the script exits with code 0 (success).
    Run ONLY ONE instance at a time.
    **Git-Bash quirk (NOT a bug):** under Git-Bash, `python` shows up as TWO `python.exe` processes (the launcher + its child) and BOTH inherit the redirected stdout, so the log output is DOUBLED — you will see two `[enumerate]` headers. This is cosmetic; it is NOT two competing runs. Do not panic and do not kill "the duplicate".
    To kill stray instances:
@@ -115,7 +111,7 @@ After launching the script detached (background), enter a monitor loop until one
 - SUMMARY block found in log → success.
 - Log contains `Insufficient budget` or `Resets at midnight UTC` → OpenAlex daily budget exhausted. STOP (do not restart). Report to main agent.
 - Restart counter ≥ 5 → too many restarts, likely a persistent error. STOP and report.
-- Subagent wall-clock budget exhausted → report current progress (line count, restart count, last 5 log lines) and tell the main agent to continue monitoring manually with `Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\enrich_openalex.log -Wait` and kill/restart manually if it hangs again.
+- Subagent wall-clock budget exhausted → report current progress (line count, restart count, last 5 log lines) and tell the main agent to continue monitoring manually with `Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_openalex.log -Wait` and kill/restart manually if it hangs again.
 
 **Implementation note:** use PowerShell with a `while` loop and `Start-Sleep -Seconds 60` for the polling. Track prev_count and hang_count variables. Use `(Get-Content $log -ErrorAction SilentlyContinue).Count` for line count. Use `Get-Process -Id $pid -ErrorAction SilentlyContinue` to check if process alive.
 
