@@ -1,6 +1,11 @@
 # PCM_RAG
 
 ## RAG Ingest Rules
+- **One SOURCE per ingest run.** If `IN\` has several new files, ingest them one at a time:
+  full cycle per source (probe, launch, verify, error-correction pass, cleanup, ledger, memory),
+  and only then start the next. Never batch several sources into one list file - a failure then
+  cannot be attributed and the delete/re-ingest repair costs minutes per document. Slices of ONE
+  source still go in ONE run. A failed or lossy source STOPS the queue; report and wait.
 - Always launch ingests via the ragkit launcher, detached, never inline:
   `& $env:RAGKIT_HOME\ingest.ps1 -Root X:\RAG_MAIN\PCM_RAG -ListFile <utf8 list>`. It produces
   `lightrag\LOG\ingest_run.log`, which progress checks depend on, and it owns `docker compose`
@@ -24,7 +29,8 @@
   `Cannot connect to C: resolve failed`.
 
 ## Vector storage: Qdrant (since 2026-09-09)
-- Vectors are NOT in `lightrag\dataag_storage` any more. They live in the docker named volume
+- Vectors are NOT in `lightrag\data
+ag_storage` any more. They live in the docker named volume
   `pcm_rag_qdrant_storage` (ext4 inside the WSL VHDX), served by `pcm_rag-qdrant-1` on
   `127.0.0.1:6333`. `LIGHTRAG_VECTOR_STORAGE=QdrantVectorDBStorage` in `lightrag\.env`.
 - **Host-side URLs must be `127.0.0.1`, never `localhost`.** localhost resolves to `::1` first and
