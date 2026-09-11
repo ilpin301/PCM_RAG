@@ -12,7 +12,7 @@ description: >-
   LIMIT=<n> (cap candidates, for testing) and REFRESH=yes (re-enrich nodes
   already marked). PRECONDITION the main agent must ensure before delegating:
   the LightRAG server is UP and IDLE (no ingest running — /graph/entity/edit
-  blocks on a busy pipeline). ZAI_API_KEY is managed by the subagent from .env — the main agent does NOT need to pass it. Default
+  blocks on a busy pipeline). ZAI_API_KEY is read from .env by the subagent — the main agent does NOT need to pass it. Default
   recommended flow: first delegate MODE=dry LIMIT=10, relay the summary, let the
   user eyeball which nodes resolve to which OpenAlex work, and only then
   delegate MODE=full on the user's OK. The run is resumable/idempotent: re-runs
@@ -140,8 +140,8 @@ OpenAlex meters a free daily budget (~$0.10 / 1000 credits, ~$0.001 per /works s
 
 ## Hard rules
 - Never start/stop the Docker server, Docker Desktop, Ollama, or any ingest yourself.
-- Never invent API keys. ZAI_API_KEY is read from (or written to) `.env` only — never hardcoded anywhere else.
+- Never invent API keys, and never write a key literal into any file. Keys are READ from `.env` only.
 - On a fresh enrichment, prefer MODE=dry first if the main agent gave you a choice; but always obey the MODE you were given.
 - Run only ONE instance of the script at a time.
 - The script is idempotent and resumable — a re-run is safe; never worry that re-running will double-write (the marker prevents it).
-- Never modify `LIGHTRAG_API_KEY` or any other `.env` key except `ZAI_API_KEY`. Only append `ZAI_API_KEY` if missing; never rewrite the file.
+- Never modify ANY key in `.env` — not `LIGHTRAG_API_KEY`, not `ZAI_API_KEY`. This agent reads `.env`; it never writes it.

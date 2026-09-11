@@ -1,1 +1,1 @@
-Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
+Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20

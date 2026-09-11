@@ -8,6 +8,8 @@ Enhancement_of_the_Phase_Transition_Enthalpy_Clinoptilolite.pdf        # 19 pp, 
 Inverse_designed_resistive_heaters_for_uniform_switching_of_Phase_Change_Materials.pdf  # 14 pp, ONE doc 2026-08-21, MinerU route, ingested via ingest_merged.py --pages 7
 Multi-PCM_Lime_Mortars_Incorporating_Polymer-Shell_and_Form-Stable_Phase_Change_Materials_.pdf  # 44 pp, ONE doc 2026-08-21, MinerU route, ingest_merged.py --pages 7 (7 slices), 143 chunks; hit serial multimodal fallback mid-run, completed anyway
 Optimization_of_Phase_Change_Material_Integration_for_Active_Cooling_Control.pdf  # 8 pp, ONE doc 2026-08-24, MinerU route, ingest_merged.py --pages 7 (2 slices); 21 equations / 12 charts / 2 tables all recognized and verified in store
+Performance_Enhancement_of_Phase_Change_Material_PCM_using_Porous_Medium_for_Electronics_C.pdf  # 15 pp, ONE doc 2026-08-25, MinerU route, ingest_merged.py --pages 7 (2 slices), 53 chunks
+Paraffin-Based_Phase_Change_Materials_PCM_with_Enhanced_Thermal_Conductivity_Through_Parti.pdf  # 57 pp, ONE doc 2026-09-10, MinerU route, ingest_merged.py --pages 7 (9 slices), 330 chunks (28 text + 302 multimodal); vectors went to nano because the merged path did not forward vector_storage - back-filled into Qdrant via migrate_nano_to_qdrant.py --apply --topup, verified
 #
 # --- ingested as renamed slice families (source PDF still sits in IN\) ---
 Electromechanical_Hysteresis_in_Phase_Change_Material_Sb2S3.pdf          # slices Electromechanical_Hysteresis_Sb2S3-01-10/-11-20/-21-30
@@ -28,5 +30,8 @@ Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building_
 Performance_Enhancement_of_Phase_Change_Material_PCM_Thermal_Energy_Storage_TES_System_Usi.pdf
 Phase_change_materials_PCMs_for_building_energy_efficiency_A_review.pdf
 The_Effect_of_Phase_Change_Material_PCM_on_Efficiency_and_Productivity_in_Tubular_Solar_Di.pdf
+Phase_Change_Materials_for_Photovoltaic_Thermal_Management.pdf
+Phase-change_material-based_external_cavity_lasers.pdf
+The_Role_of_Aluminium_Nitride_as_Reinforcement_Material_for_Phase_Change_Materials_PCMS.pdf  # 2026-09-09 step6 qdrant proving ingest
 # --- PARTIAL: do NOT treat as done ---
 # (no PARTIAL documents outstanding)

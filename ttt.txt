@@ -18,3 +18,6 @@ Build an OpenAlex enricher like the PubChem one" (and later the same for arXiv)
 ok, stop the process at this point. Remember all important info for next sessions run
 
 Look at this conversation and check if you've added everything you need to all rag skills to avoid and fix all issues.
+-------------------------------------------------------------------
+did you fix all the errors that occurred?
+commit and push all kit files, delete the dead vdb_*.json (143 MB), delete the failure logs

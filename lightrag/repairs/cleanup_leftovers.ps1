@@ -18,12 +18,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$LightragDir = "F:\____IL_AI\PCM_RAG\lightrag"
+$LightragDir = "X:\RAG_MAIN\PCM_RAG\lightrag"
 $RagStorage  = Join-Path $LightragDir "data\rag_storage"
 $MineruOut   = Join-Path $LightragDir "data\mineru_output"
 $ParsedDir   = Join-Path $LightragDir "data\inputs\__parsed__"
 $LogDir      = Join-Path $LightragDir "LOG"
-$PythonExe   = "F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe"
+$PythonExe   = "X:\RAG_MAIN\RAG\lightrag\.venv-rag\Scripts\python.exe"
 $CheckVectorsScript = Join-Path $LightragDir "check_vectors.py"
 
 # If no section switch given, all four are in scope.

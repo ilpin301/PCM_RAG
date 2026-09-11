@@ -70,6 +70,28 @@ def _preserve_mode(tmp: str, dst: str, workspace: str) -> None:
         logger.warning(f"[{workspace}] Could not preserve mode of {dst}: {exc}")
 
 
+def _fsync_file(path: str, workspace: str) -> None:
+    """Force ``path``'s data to stable storage before the rename.
+
+    ``os.replace`` orders only the *metadata* change. On a bugcheck or power
+    loss NTFS can commit the rename while the tmp's data pages are still in
+    the cache - the destination then comes back as a full-length run of NUL
+    bytes (observed here on graphml and vdb_entities after the 2026-08 BSOD).
+
+    Best-effort: a failed fsync is logged, not raised, so a filesystem that
+    cannot flush never blocks the write. O_RDWR because Windows'
+    ``_commit`` needs a writable handle.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        logger.warning(f"[{workspace}] fsync of {path} failed: {exc}")
+
+
 def reap_orphan_tmp_files(
     file_name: str,
     workspace: str = "_",
@@ -129,6 +151,7 @@ def atomic_write(
     tmp = tmp_path_for(file_name)
     try:
         write_fn(tmp)
+        _fsync_file(tmp, workspace)
         _preserve_mode(tmp, file_name, workspace)
         os.replace(tmp, file_name)
     except BaseException:

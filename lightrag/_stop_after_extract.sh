@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /f/____IL_AI/PCM_RAG/lightrag
+cd /x/RAG_MAIN/PCM_RAG/lightrag
 cnt(){ python -c "import json;print(len(json.load(open('data/enrich_cache/$1.json',encoding='utf-8'))))" 2>/dev/null || echo -1; }
 kill_enrich(){
   powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object {\$_.CommandLine -like '*enrich_openalex*'} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force; Write-Output ('killed '+\$_.ProcessId) }" 2>/dev/null

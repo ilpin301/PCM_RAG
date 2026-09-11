@@ -8,14 +8,14 @@ GraphRAG knowledge base: documents go in, LightRAG builds a knowledge graph (ent
 |---|---|---|
 | Web UI / API | http://localhost:9622 | http://localhost:9621 |
 | API key (`X-API-Key`) | `see lightrag/.env` | `see lightrag/.env` |
-| Folder | `F:\____IL_AI\PCM_RAG\lightrag` | `F:\____IL_AI\RAG\lightrag` |
+| Folder | `X:\RAG_MAIN\PCM_RAG\lightrag` | `X:\RAG_MAIN\RAG\lightrag` |
 | Container | `pcm_rag-lightrag-1` | `lightrag-lightrag-1` |
 
-Shared by both: Ollama embeddings (bge-m3), Z.ai LLMs (glm-5.2 text, glm-4.5v vision), Python venv at `F:\____IL_AI\RAG\lightrag\.venv-rag`, MinerU model cache, GPU.
+Shared by both: Ollama embeddings (bge-m3), Z.ai LLMs (glm-5.2 text, glm-4.5v vision), Python venv at `X:\RAG_MAIN\RAG\lightrag\.venv-rag`, MinerU model cache, GPU.
 
 ## The easy way: talk to Claude Code
 
-Project skills live in `F:\____IL_AI\PCM_RAG\.claude\skills\`. Open Claude Code in `F:\____IL_AI\PCM_RAG` and just say:
+Project skills live in `X:\RAG_MAIN\PCM_RAG\.claude\skills\`. Open Claude Code in `X:\RAG_MAIN\PCM_RAG` and just say:
 
 - **"ask the rag: what does document X say about Y?"** → lightrag-query skill
 - **"upload C:\...\paper.pdf to the rag"** → lightrag-upload skill (text docs)
@@ -35,7 +35,7 @@ Interactive API reference (all endpoints, try-it-out): **http://localhost:9622/d
 ## The direct way: API commands (PowerShell)
 
 ```powershell
-$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+$key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
 $h = @{'X-API-Key'=$key; 'Content-Type'='application/json'}
 
 # Health check
@@ -73,7 +73,7 @@ Invoke-RestMethod http://localhost:9622/documents -Method Delete -Headers $h
 
 ## Ingesting scanned / image-heavy PDFs (RAG-Anything + MinerU)
 
-**Source folder rule: ingest ONLY from `F:\____IL_AI\PCM_RAG\IN\`** — don't ingest or touch files in other folders; copy documents into `IN\` first.
+**Source folder rule: ingest ONLY from `X:\RAG_MAIN\PCM_RAG\IN\`** — don't ingest or touch files in other folders; copy documents into `IN\` first.
 
 Web upload handles plain text fine; scans and chart-heavy PDFs need the MinerU pipeline (GPU-parsed, images described by glm-4.5v):
 
@@ -82,14 +82,14 @@ Web upload handles plain text fine; scans and chart-heavy PDFs need the MinerU p
 curl.exe -s http://localhost:11434/api/version    # no answer → start Ollama first!
 
 # 2. Stop the container (ingest writes the same storage files)
-Set-Location F:\____IL_AI\PCM_RAG\lightrag
+Set-Location X:\RAG_MAIN\PCM_RAG\lightrag
 docker compose stop
 
 # 3. Run ingest (shared venv)
-$env:Path = "F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts;$env:Path"
+$env:Path = "X:\RAG_MAIN\RAG\lightrag\.venv-rag\Scripts;$env:Path"
 $env:NO_PROXY='*'; $env:PYTHONIOENCODING='utf-8'; $env:MINERU_DEVICE_MODE='cuda'
 $env:TIKTOKEN_CACHE_DIR='C:\Users\il720506\AppData\Local\Temp\data-gym-cache'   # required: tiktoken download blocked by proxy
-& F:\____IL_AI\RAG\lightrag\.venv-rag\Scripts\python.exe rag_ingest.py "C:\path\doc1.pdf" "C:\path\doc2.pdf"
+& X:\RAG_MAIN\RAG\lightrag\.venv-rag\Scripts\python.exe rag_ingest.py "C:\path\doc1.pdf" "C:\path\doc2.pdf"
 
 # 4. Restart server
 docker compose start
@@ -100,14 +100,14 @@ docker compose start
 ## Operations
 
 ```powershell
-Set-Location F:\____IL_AI\PCM_RAG\lightrag
+Set-Location X:\RAG_MAIN\PCM_RAG\lightrag
 docker compose up -d      # start (Docker Desktop must be running — check: docker info)
 docker compose stop       # stop (keeps container)
 docker compose down       # remove container (data stays — bind mounts)
 docker logs pcm_rag-lightrag-1 --tail 50   # server logs
 ```
 
-Data lives in `F:\____IL_AI\PCM_RAG\lightrag\data\rag_storage` — backup = copy this folder (container stopped).
+Data lives in `X:\RAG_MAIN\PCM_RAG\lightrag\data\rag_storage` — backup = copy this folder (container stopped).
 
 ## Cost control
 
@@ -125,14 +125,14 @@ Data lives in `F:\____IL_AI\PCM_RAG\lightrag\data\rag_storage` — backup = copy
 
 ## More docs
 
-- `F:\____IL_AI\RAG\INSTALL.md` — full as-built install reference
-- `F:\____IL_AI\RAG\REPLICATE.md` — how to build another instance (port, COMPOSE_PROJECT_NAME, venv sharing)
+- `X:\RAG_MAIN\RAG\INSTALL.md` — full as-built install reference
+- `X:\RAG_MAIN\RAG\REPLICATE.md` — how to build another instance (port, COMPOSE_PROJECT_NAME, venv sharing)
 - http://localhost:9622/docs — live API reference
 
 ## Monitoring live ingest
 
 ```powershell
-Get-Content F:\____IL_AI\PCM_RAG\lightrag\ingest_run.log -Wait -Tail 20
+Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\ingest_run.log -Wait -Tail 20
 ```
 
 Ctrl+C to stop. Success = `EXITCODE=0` at the end of the log.

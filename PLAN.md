@@ -10,7 +10,7 @@ references to base path, port and container name. Fixes applied to one base (the
 `periodic_cache_flush` crash guard, the `check_vectors` poison gate, the PDF route probe) do not
 reach the others, and `PORT_RAG_TOOLING.md` exists solely to describe the manual copy.
 
-Replace that with one shared, version-controlled toolkit at `F:\____IL_AI\RAG\ragkit\` and one
+Replace that with one shared, version-controlled toolkit at `X:\RAG_MAIN\RAG\ragkit\` and one
 set of user-level skills at `~\.claude\skills\` that auto-derive every per-base fact at runtime.
 A new RAG base should then need zero tooling setup: create it, and the skills work.
 
@@ -29,7 +29,7 @@ does not have at all.
 
 This plan is built to be executed across several sessions. The segments below are ordered but individually shippable: **every segment ends with both bases fully working**, so a session may stop after any of them. Nothing is deleted until Segments 5 and 6, and until then both bases still run on their original launchers.
 
-**Status:** **DONE - S0 through S8 complete** (2026-08-25). Kit `F:\____IL_AI\RAG\ragkit` at `41d51e6`, PCM at `b34260e`, MECH at `615f8a0`. Both bases run only through the kit. S7 audit found no damage in MECH: 48/48 processed, zero orphaned vectors, snapshot identical, baseline recorded in MECH project memory.
+**Status:** **DONE - S0 through S8 complete** (2026-08-25). Kit `X:\RAG_MAIN\RAG\ragkit` at `41d51e6`, PCM at `b34260e`, MECH at `615f8a0`. Both bases run only through the kit. S7 audit found no damage in MECH: 48/48 processed, zero orphaned vectors, snapshot identical, baseline recorded in MECH project memory.
 plus the S5 bookkeeping commit, MECH at `a8b505f`. **PCM_RAG now runs ONLY through the kit.** MECH is
 untouched and still runs on `ingest_detached.ps1` - that is S6.
 
@@ -104,7 +104,7 @@ Two standing rules across all segments: take a `rag_sync.ps1 push` snapshot befo
   (`LLM_BINDING_API_KEY` vs `ZAI_API_KEY`), the entrypoint (`rag_ingest.py` vs
   `ingest_merged.py --pages`), and PCM's extra failure branch (timestamped log, `ingest_triage.py`,
   `LAST_FAILURE.txt`, beep).
-- Both bases already share one venv: `F:\____IL_AI\RAG\lightrag\.venv-rag`. `ragkit` sits beside it.
+- Both bases already share one venv: `X:\RAG_MAIN\RAG\lightrag\.venv-rag`. `ragkit` sits beside it.
 - Both wav files exist on this machine.
 - Each base carries its OWN vendored `lightrag\lightrag\` package that shadows the venv install via
   `sys.path[0]`. Measured: PCM vendored vs venv `lightrag_hku` = 144 differing files; PCM vendored

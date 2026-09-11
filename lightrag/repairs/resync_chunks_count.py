@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-RAG_STORAGE = Path(r"F:\____IL_AI\PCM_RAG\lightrag\data\rag_storage")
+RAG_STORAGE = Path(r"X:\RAG_MAIN\PCM_RAG\lightrag\data\rag_storage")
 DOC_STATUS = RAG_STORAGE / "kv_store_doc_status.json"
 TEXT_CHUNKS = RAG_STORAGE / "kv_store_text_chunks.json"
 CONTAINER_NAME = "pcm_rag-lightrag-1"

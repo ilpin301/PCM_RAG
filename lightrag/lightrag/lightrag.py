@@ -1699,18 +1699,42 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     ) -> None:
         storages = self._index_storages()
 
+        def _storage_path(storage_inst):
+            for attr in ("_client_file_name", "_graphml_xml_file", "_file_name"):
+                path = getattr(storage_inst, attr, None)
+                if path:
+                    return path
+            return None
+
         async def _flush_one(storage_inst) -> None:
             # Wrap each flush so a failure carries the driver name + namespace.
             # The pipeline uses this to abort the batch with an actionable
             # reason instead of misattributing a shared-buffer flush error to
             # whichever document happened to trigger index_done_callback.
+            #
+            # The start/done lines are load-bearing for crash forensics: the
+            # heavy saves (a multi-GB vector store) log nothing of their own,
+            # so a process killed inside the flush left a log whose last line
+            # named a *different* storage that had already finished writing.
+            name = type(storage_inst).__name__
+            namespace = getattr(storage_inst, "final_namespace", None) or getattr(
+                storage_inst, "namespace", ""
+            )
+            logger.info(f"Flush start: {name}[{namespace}]")
+            started = time.perf_counter()
             try:
                 await cast(StorageNameSpace, storage_inst).index_done_callback()
             except Exception as e:
-                namespace = getattr(storage_inst, "final_namespace", None) or getattr(
-                    storage_inst, "namespace", ""
-                )
-                raise IndexFlushError(type(storage_inst).__name__, namespace, e) from e
+                raise IndexFlushError(name, namespace, e) from e
+            path = _storage_path(storage_inst)
+            try:
+                size_mb = os.path.getsize(path) / 2**20 if path else 0.0
+            except OSError:
+                size_mb = 0.0
+            logger.info(
+                f"Flush done: {name}[{namespace}] "
+                f"{time.perf_counter() - started:.1f}s {size_mb:.1f} MB"
+            )
 
         # Await every flush to completion (return_exceptions=True) before
         # raising. With the default gather, the first IndexFlushError is

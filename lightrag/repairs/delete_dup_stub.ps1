@@ -5,7 +5,7 @@ param([switch]$Apply)
 
 $ErrorActionPreference = 'Stop'
 $stubs = @('dup-b85eb57c176c324b03906870300d8f34')
-$key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+$key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
 $h = @{ 'X-API-Key' = $key; 'Content-Type' = 'application/json' }
 
 $live = (Invoke-RestMethod http://localhost:9622/documents -Headers $h)

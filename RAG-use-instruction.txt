@@ -12,10 +12,10 @@ http://localhost:9622, API key: (stored in lightrag/.env as LIGHTRAG_API_KEY —
 BEFORE ASKING QUESTIONS:
   1. Docker Desktop (check: docker info)
   2. LightRAG container:
-       cd F:\____IL_AI\PCM_RAG\lightrag
+       cd X:\RAG_MAIN\PCM_RAG\lightrag
        docker compose up -d
      check: open http://localhost:9622 in browser, or:
-       $key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+       $key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
        curl.exe -s http://localhost:9622/health -H "X-API-Key: $key"
   3. Ollama (embeddings for query context lookup):
        check: curl.exe -s http://localhost:11434/api/version
@@ -37,12 +37,12 @@ WAY A — Web UI (easiest):
   Graph tab: explore entities/relationships visually.
 
 WAY B — Claude Code (this project):
-  Open Claude Code in F:\____IL_AI\PCM_RAG and just say:
+  Open Claude Code in X:\RAG_MAIN\PCM_RAG and just say:
     "ask the rag: what does the biomass ash paper say about porosity?"
   Claude uses the lightrag-query skill automatically.
 
 WAY C — Direct API (PowerShell, works from any script):
-  $key = (Get-Content F:\____IL_AI\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+  $key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
   $h = @{'X-API-Key'=$key; 'Content-Type'='application/json'}
   $body = '{"query":"YOUR QUESTION","mode":"hybrid"}'
   (Invoke-RestMethod http://localhost:9622/query -Method Post -Headers $h -Body $body).response
@@ -58,7 +58,7 @@ WAY C — Direct API (PowerShell, works from any script):
 3. HOW TO INGEST NEW DOCUMENTS
 ----------------------------------------------------------------
 
-RULE: put files ONLY into F:\____IL_AI\PCM_RAG\IN\ first.
+RULE: put files ONLY into X:\RAG_MAIN\PCM_RAG\IN\ first.
 Never ingest from other folders.
 
 Simple text PDFs: upload via Web UI (drag & drop) — server must be UP.
@@ -71,11 +71,11 @@ Scanned / chart-heavy PDFs (full pipeline: MinerU + GLM vision):
   Manual alternative — this base has NO launcher of its own any more;
   everything runs through the shared kit at %RAGKIT_HOME%:
     1. write the PDF paths, one per line, UTF-8, into
-       F:\____IL_AI\PCM_RAG\lightrag\ingest_list.txt
+       X:\RAG_MAIN\PCM_RAG\lightrag\ingest_list.txt
     2. Start-Process pwsh -ArgumentList "-NoProfile","-File","$env:RAGKIT_HOME\ingest.ps1",
-         "-Root","F:\____IL_AI\PCM_RAG","-ListFile","F:\____IL_AI\PCM_RAG\lightrag\ingest_list.txt" -WindowStyle Hidden
+         "-Root","X:\RAG_MAIN\PCM_RAG","-ListFile","X:\RAG_MAIN\PCM_RAG\lightrag\ingest_list.txt" -WindowStyle Hidden
        (the launcher stops docker itself — do NOT stop it first)
-    3. watch: Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
+    3. watch: Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\LOG\ingest_run.log -Wait -Tail 20
     4. success = EXITCODE=0, the log is deleted, Ring10.wav plays and docker
        restarts automatically. Failure = the log is kept as
        ingest_FAILED_<stamp>.log, LAST_FAILURE.txt holds the triage verdict,
@@ -117,4 +117,4 @@ Full interactive API reference: http://localhost:9622/docs
   - Never change the embedding model (bge-m3) — old vectors become garbage.
   - Ingest interrupted? Safe. Re-run — caches make it cheap. But queries
     only work after a run finishes cleanly (EXITCODE=0).
-  - More details: F:\____IL_AI\PCM_RAG\USAGE.md
+  - More details: X:\RAG_MAIN\PCM_RAG\USAGE.md

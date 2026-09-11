@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /f/____IL_AI/PCM_RAG/lightrag
+cd /x/RAG_MAIN/PCM_RAG/lightrag
 LOG=_enrich_full.log
 killp(){ powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object {\$_.CommandLine -like '*enrich_openalex*'} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" 2>/dev/null; }
 nproc_enrich(){ powershell -NoProfile -Command "@(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object {\$_.CommandLine -like '*enrich_openalex*'}).Count" 2>/dev/null; }

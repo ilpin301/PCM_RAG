@@ -2,8 +2,8 @@ Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
 Start-Process "C:\Users\il720506\AppData\Local\Programs\Ollama\ollama app.exe"
 ----------------------------------------------------------------------------------------------------------------------------------
 $env:ZAI_API_KEY="b7ba0c16f53d28177cdca8173f800d35"; $env:NO_PROXY="*"
-cd F:\____IL_AI\PCM_RAG\lightrag
+cd X:\RAG_MAIN\PCM_RAG\lightrag
 python enrich_openalex.py
 ----------------------------------------------------------------------------------------------------------------------------------
-Get-Content F:\____IL_AI\PCM_RAG\lightrag\LOG\enrich_openalex.log -Wait
+Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_openalex.log -Wait
 ----------------------------------------------------------------------------------------------------------------------------------

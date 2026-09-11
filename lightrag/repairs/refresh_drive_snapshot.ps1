@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$LightragDir  = "F:\____IL_AI\PCM_RAG\lightrag"
+$LightragDir  = "X:\RAG_MAIN\PCM_RAG\lightrag"
 $RagStorage   = Join-Path $LightragDir "data\rag_storage"
 $DriveDir     = "J:\My Drive\RAG\PCM_RAG"
 $SnapshotPath = Join-Path $DriveDir "rag_storage.tgz"
@@ -53,7 +53,7 @@ $candidate = Join-Path $LightragDir "rag_sync.ps1"
 if (Test-Path $candidate) {
     $syncScript = $candidate
 } else {
-    $found = Get-ChildItem "F:\____IL_AI\PCM_RAG" -Recurse -Filter "rag_sync.ps1" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $found = Get-ChildItem "X:\RAG_MAIN\PCM_RAG" -Recurse -Filter "rag_sync.ps1" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found) { $syncScript = $found.FullName }
 }
 
@@ -91,7 +91,7 @@ if ($syncScript) {
         Write-Host "DRY RUN — would invoke: $syncScript push"
     }
 } else {
-    Write-Host "No rag_sync.ps1 found anywhere under F:\____IL_AI\PCM_RAG — falling back to manual tar."
+    Write-Host "No rag_sync.ps1 found anywhere under X:\RAG_MAIN\PCM_RAG — falling back to manual tar."
     $tempTgz = Join-Path $env:TEMP ("rag_storage_{0}.tgz" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 
     if ($Apply) {
