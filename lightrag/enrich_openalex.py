@@ -12,7 +12,7 @@ each other.
 
 PRECONDITIONS:
   - LightRAG server UP and IDLE (no ingest running) at LIGHTRAG_URL.
-  - ZAI_API_KEY set (glm-5.2 extract + judge via z.ai).
+  - ZAI_API_KEY set (glm-5.3 extract + judge via z.ai).
   - Ollama not required (no embedding done here; server re-embeds on edit).
 
 USAGE:
@@ -68,7 +68,7 @@ LIGHTRAG_KEY = _load_lightrag_key()
 
 ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_BASE = "https://api.z.ai/api/coding/paas/v4"
-LLM_MODEL = "glm-5.2"
+LLM_MODEL = "glm-5.3"
 
 OPENALEX = "https://api.openalex.org"
 MAILTO = "ilpin301@gmail.com"  # polite pool — approved by user

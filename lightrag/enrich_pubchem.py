@@ -9,7 +9,7 @@ block, never stack.
 
 PRECONDITIONS:
   - LightRAG server UP and IDLE (no ingest running) at LIGHTRAG_URL.
-  - ZAI_API_KEY set (glm-5.2 judge via z.ai).
+  - ZAI_API_KEY set (glm-5.3 judge via z.ai).
   - Ollama not required (no embedding done here; server re-embeds on edit).
 
 USAGE:
@@ -60,7 +60,7 @@ LIGHTRAG_KEY = _load_lightrag_key()
 
 ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_BASE = "https://api.z.ai/api/coding/paas/v4"
-JUDGE_MODEL = "glm-5.2"
+JUDGE_MODEL = "glm-5.3"
 
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov"
 PUBCHEM_HEADERS = {

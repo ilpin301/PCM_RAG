@@ -11,7 +11,7 @@ GraphRAG knowledge base: documents go in, LightRAG builds a knowledge graph (ent
 | Folder | `X:\RAG_MAIN\PCM_RAG\lightrag` | `X:\RAG_MAIN\RAG\lightrag` |
 | Container | `pcm_rag-lightrag-1` | `lightrag-lightrag-1` |
 
-Shared by both: Ollama embeddings (bge-m3), Z.ai LLMs (glm-5.2 text, glm-4.5v vision), Python venv at `X:\RAG_MAIN\RAG\lightrag\.venv-rag`, MinerU model cache, GPU.
+Shared by both: Ollama embeddings (bge-m3), Z.ai LLMs (glm-5.3 text, glm-4.5v vision), Python venv at `X:\RAG_MAIN\RAG\lightrag\.venv-rag`, MinerU model cache, GPU.
 
 ## The easy way: talk to Claude Code
 
@@ -111,8 +111,8 @@ Data lives in `X:\RAG_MAIN\PCM_RAG\lightrag\data\rag_storage` — backup = copy 
 
 ## Cost control
 
-- Queries: cheap (one glm-5.2 call). Ingestion: expensive part (entity extraction per chunk + vision calls).
-- Bulk ingestion: switch `.env` → `LLM_MODEL=glm-5-turbo`, restart container, ingest, switch back to `glm-5.2` for query quality.
+- Queries: cheap (one glm-5.3 call). Ingestion: expensive part (entity extraction per chunk + vision calls).
+- Bulk ingestion: switch `.env` → `LLM_MODEL=glm-5-turbo`, restart container, ingest, switch back to `glm-5.3` for query quality.
 - Re-ingesting the same content is cheap — LLM cache replays free. Wiping storage also wipes that cache.
 
 ## Rules that keep it alive (violate = broken storage)
