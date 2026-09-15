@@ -9,3 +9,8 @@ venv/
 .cache/
 .playwright-mcp/
 .obsidian/
+
+# --- editor / script backups ---
+*.bak
+*.bak-*
+*.bak.*
