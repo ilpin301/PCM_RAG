@@ -10,6 +10,7 @@ Multi-PCM_Lime_Mortars_Incorporating_Polymer-Shell_and_Form-Stable_Phase_Change_
 Optimization_of_Phase_Change_Material_Integration_for_Active_Cooling_Control.pdf  # 8 pp, ONE doc 2026-08-24, MinerU route, ingest_merged.py --pages 7 (2 slices); 21 equations / 12 charts / 2 tables all recognized and verified in store
 Performance_Enhancement_of_Phase_Change_Material_PCM_using_Porous_Medium_for_Electronics_C.pdf  # 15 pp, ONE doc 2026-08-25, MinerU route, ingest_merged.py --pages 7 (2 slices), 53 chunks
 Paraffin-Based_Phase_Change_Materials_PCM_with_Enhanced_Thermal_Conductivity_Through_Parti.pdf  # 57 pp, ONE doc 2026-09-10, MinerU route, ingest_merged.py --pages 7 (9 slices), 330 chunks (28 text + 302 multimodal); vectors went to nano because the merged path did not forward vector_storage - back-filled into Qdrant via migrate_nano_to_qdrant.py --apply --topup, verified
+Phase_Change_Materials_PCM_in_Construction_as_a_Sustainable_Strategy_State-of-the-Art_Revi.pdf  # 16 pp, ONE doc 2026-09-15, MinerU route, ingest_merged.py --pages 7, 49 chunks; 1 transient z.ai 429 (1305), zero permanent loss
 #
 # --- ingested as renamed slice families (source PDF still sits in IN\) ---
 Electromechanical_Hysteresis_in_Phase_Change_Material_Sb2S3.pdf          # slices Electromechanical_Hysteresis_Sb2S3-01-10/-11-20/-21-30

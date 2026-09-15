@@ -28,7 +28,7 @@ services:
       - ./data/prompts:/app/data/prompts
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
-    restart: on-failure:10
+    restart: "no"
     environment:
       WORKING_DIR: "/app/data/rag_storage"
       INPUT_DIR: "/app/data/inputs"
