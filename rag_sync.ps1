@@ -2,13 +2,13 @@
 # Lives in the repo root, next to the lightrag\ folder.
 #   .\rag_sync.ps1 push     # this machine's DB -> Drive
 #   .\rag_sync.ps1 pull     # Drive -> this machine's DB (full overwrite, not a merge)
-# Drive root: -DriveDir, else $env:MECH_RAG_DRIVE, else "J:\My Drive\RAG" (the ilpin301 account).
-# Snapshot lives in <root>\<project>\rag_storage.tgz - e.g. "...\RAG\MECH_RAG\rag_storage.tgz".
+# Drive root: -DriveDir, else $env:PCM_RAG_DRIVE, else "J:\My Drive\RAG" (the ilpin301 account).
+# Snapshot lives in <root>\<project>\rag_storage.tgz - e.g. "...\RAG\PCM_RAG\rag_storage.tgz".
 # The project subfolder is created by the first push.
 # The LightRAG container is stopped for the duration and restarted only if it was running.
 param(
     [Parameter(Mandatory, Position = 0)][ValidateSet('push', 'pull')][string]$Action,
-    [string]$DriveDir = $(if ($env:MECH_RAG_DRIVE) { $env:MECH_RAG_DRIVE } else { 'J:\My Drive\RAG' }),
+    [string]$DriveDir = $(if ($env:PCM_RAG_DRIVE) { $env:PCM_RAG_DRIVE } else { 'J:\My Drive\RAG' }),
     [switch]$KeepRunning,
     [switch]$Force
 )
@@ -71,6 +71,18 @@ if (-not $KeepRunning) {
             throw "LightRAG is mid-ingest (busy=$($health.pipeline_busy) active=$($health.pipeline_active) scanning=$($health.pipeline_scanning)).`nWait for it to finish, or pass -Force to stop it anyway."
         }
         "WARNING: pipeline busy, -Force given - the running ingest will be killed."
+    }
+
+    # The /health flags only cover server-side ingests. ingest_detached.ps1 runs python
+    # outside the container and writes rag_storage directly, so a snapshot taken during
+    # one is truncated. Detect it by command line - a PID file would go stale on a crash.
+    $ingest = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*rag_ingest.py*' })
+    if ($ingest) {
+        if (-not $Force) {
+            throw "A detached ingest is running (PID $($ingest.ProcessId -join ', ')).`nWait for it to finish, or pass -Force to snapshot anyway."
+        }
+        "WARNING: detached ingest running, -Force given - the snapshot may be inconsistent."
     }
 
     if (Get-Command docker -ErrorAction SilentlyContinue) {
