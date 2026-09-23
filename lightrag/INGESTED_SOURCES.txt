@@ -34,5 +34,6 @@ The_Effect_of_Phase_Change_Material_PCM_on_Efficiency_and_Productivity_in_Tubula
 Phase_Change_Materials_for_Photovoltaic_Thermal_Management.pdf
 Phase-change_material-based_external_cavity_lasers.pdf
 The_Role_of_Aluminium_Nitride_as_Reinforcement_Material_for_Phase_Change_Materials_PCMS.pdf  # 2026-09-09 step6 qdrant proving ingest
+Additive_Manufacturing_for_Phase_Change_Thermal_Energy_Storage_and_Management.pdf  # 2026-09-23 merged 20x10p, 214 chunks
 # --- PARTIAL: do NOT treat as done ---
 # (no PARTIAL documents outstanding)
