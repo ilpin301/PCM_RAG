@@ -14,3 +14,4 @@ venv/
 *.bak
 *.bak-*
 *.bak.*
+lightrag/ingest_list.txt
