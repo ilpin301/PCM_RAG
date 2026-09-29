@@ -20,7 +20,18 @@ USAGE:
   python enrich_pubchem.py --limit 10 # cap candidates (testing)
   python enrich_pubchem.py --fix-blocks            # clean existing blocks (strip/rewrite), needs no ZAI key
   python enrich_pubchem.py --fix-blocks --dry-run  # same, log only, NO writes
+  python enrich_pubchem.py --max-glm-tokens 500000  # stop cleanly once GLM has used N tokens (0 = no cap)
+  python enrich_pubchem.py --ignore-resume  # start although RESUME.json says a quota stop is still active
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
+
+EXIT CODES:
+  0  ok
+  1  fatal precondition (missing key / graphml)
+  2  judge_error abort (>10% of names failed to judge)
+  3  Ollama unreachable (write runs)
+  4  stopped on GLM quota or --max-glm-tokens budget (resume later): judge.json is saved and
+     data/enrich_cache/RESUME.json says when to re-run; stops BEFORE any PubChem fetch or graph write.
+     Re-run the same command after reset_at; judged names, PubChem cache and graph markers skip finished work.
 """
 import argparse
 import asyncio
@@ -30,6 +41,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -45,6 +57,7 @@ SCRIPT_DIR = Path(__file__).parent
 GRAPHML = SCRIPT_DIR / "data" / "rag_storage" / "graph_chunk_entity_relation.graphml"
 CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
+RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
 FACTS_VERSION = 3  # bump when fact parsing changes; stale-version CID cache files are re-fetched
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
@@ -213,14 +226,61 @@ def _rule_skip(name):
     return len(n) == 1 or bool(RULE_SKIP_RE.search(n))
 
 
+QUOTA_CODES = {"1308", "1309", "1310", "1113"}  # 5h/weekly/monthly usage limit, insufficient balance
+QUOTA_MSG_RE = re.compile(r"usage limit|quota|insufficient balance|limit will reset", re.IGNORECASE)
+RESET_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?")
+SAVE_EVERY = 25  # judge.json is saved every N new verdicts (plus in judge_all's finally)
+
+# GLM run state: stop = None | "glm_quota" | "glm_budget"; single-threaded asyncio, plain dict is enough
+_glm = {"tokens": 0, "max": 0, "stop": None, "reset_at": None, "new": 0}
+_not_judged = set()  # names skipped because the stop flag was set (NOT judge errors)
+
+
+def _zai_quota_error(response):
+    """(is_quota, reset_at_str|None) for a z.ai reply. 1305 (concurrency) is NOT quota: it backs off."""
+    try:
+        body = response.json()
+    except ValueError:
+        return False, None
+    if not isinstance(body, dict):
+        return False, None
+    err = body.get("error") if isinstance(body.get("error"), dict) else body
+    code = str(err.get("code", ""))
+    msg = str(err.get("message") or err.get("msg") or "")
+    if code == "1305":
+        return False, None
+    if code in QUOTA_CODES or QUOTA_MSG_RE.search(msg):
+        m = RESET_AT_RE.search(msg)
+        return True, m.group(0) if m else None
+    return False, None
+
+
+def _request_stop(reason, reset_at=None):
+    if _glm["stop"] is None:
+        _glm["stop"], _glm["reset_at"] = reason, reset_at
+        log(f"[judge] STOP requested ({reason}, reset_at={reset_at}); no further z.ai calls")
+
+
 async def judge_one(client, sem, name, cache, refresh=False):
-    """Returns (name, verdict); verdict None = judge error (never cached)."""
+    """Returns (name, verdict); verdict None = judge error (never cached), or - when the stop flag
+    is set - not judged (name goes into _not_judged; NOT a judge error)."""
     if _rule_skip(name):  # first: overrides old cached verdicts, no z.ai call, no cache write
         return name, {"decision": "skip", "canonical": None}
     if name in cache and not (refresh and cache[name].get("decision") == "skip"):
         return name, cache[name]
+
+    def stopped():
+        if _glm["stop"]:
+            _not_judged.add(name)
+            return True
+        return False
+
+    if stopped():
+        return name, None
     async with sem:
         for attempt in range(4):
+            if stopped():  # flag may have been set while this task waited for the semaphore / backed off
+                return name, None
             try:
                 r = await client.post(
                     f"{ZAI_BASE}/chat/completions",
@@ -235,16 +295,28 @@ async def judge_one(client, sem, name, cache, refresh=False):
                     },
                     timeout=60,
                 )
+                is_quota, reset_at = _zai_quota_error(r)
+                if is_quota:  # usage limit / balance: retrying is pointless, stop cleanly
+                    _request_stop("glm_quota", reset_at)
+                    _not_judged.add(name)
+                    return name, None
                 if r.status_code == 429 or "1305" in r.text:
                     await asyncio.sleep(2 * (attempt + 1))  # z.ai concurrency (1305): back off
                     continue
                 r.raise_for_status()
-                out = r.json()["choices"][0]["message"]["content"].strip()
+                body = r.json()
+                _glm["tokens"] += int((body.get("usage") or {}).get("total_tokens") or 0)
+                if _glm["max"] and _glm["tokens"] >= _glm["max"]:
+                    _request_stop("glm_budget")  # this reply is still used; later calls are not made
+                out = body["choices"][0]["message"]["content"].strip()
                 verdict = _parse_judge(out)
                 if verdict is None:
                     log(f"[judge] unparseable reply for {name!r}: {out[:80]!r}")
                     return name, None
                 cache[name] = verdict
+                _glm["new"] += 1
+                if _glm["new"] % SAVE_EVERY == 0:
+                    save_judge_cache(cache)
                 return name, verdict
             except Exception as e:
                 if attempt == 3:
@@ -274,11 +346,68 @@ def _parse_judge(text):
 
 async def judge_all(names, cache, refresh=False):
     sem = asyncio.Semaphore(2)  # z.ai 1305 is a concurrency limit — never exceed 2
-    async with httpx.AsyncClient(trust_env=False) as client:
-        results = await asyncio.gather(
-            *(judge_one(client, sem, n, cache, refresh) for n in names))
-    save_judge_cache(cache)
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            results = await asyncio.gather(
+                *(judge_one(client, sem, n, cache, refresh) for n in names))
+    finally:  # a crash/kill loses at most SAVE_EVERY verdicts
+        save_judge_cache(cache)
     return dict(results)
+
+
+def _read_resume():
+    f = CACHE_DIR / RESUME_FILE
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}  # unreadable marker: treat as a resumable stop
+
+
+def _resume_gate(ignore):
+    """Startup gate: exit 4 while a recorded quota stop is still active; else clear the marker."""
+    info = _read_resume()
+    if info is None:
+        return
+    reset_at = info.get("reset_at")
+    if reset_at and not ignore:
+        try:
+            until = datetime.fromisoformat(str(reset_at).replace("T", " "))  # naive, machine-local
+        except ValueError:
+            until = None
+        if until and until > datetime.now():
+            log(f"quota stop still active until {reset_at}; not starting "
+                "(--ignore-resume to override)")
+            sys.exit(4)
+    log(f"[resume] previous stop ({info.get('reason')}) is being resumed"
+        + (" (gate ignored)" if ignore else "") + "; removing RESUME.json")
+    (CACHE_DIR / RESUME_FILE).unlink(missing_ok=True)
+
+
+def _write_resume_and_exit(names):
+    """GLM quota/budget stop: judge.json is already saved. Record RESUME.json, log, exit 4."""
+    info = {
+        "stopped_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "reason": _glm["stop"],
+        "reset_at": _glm["reset_at"],
+        "glm_tokens_used": _glm["tokens"],
+        "judged_this_run": _glm["new"],
+        "not_judged_remaining": len(_not_judged),
+        "resume_command": " ".join(["python", "enrich_pubchem.py"] + sys.argv[1:]),
+        "note": "judge.json is saved; re-run the same command after reset_at; "
+                "PubChem cache and graph markers make the re-run skip finished work",
+    }
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / RESUME_FILE).write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    log("\n==== STOP (GLM) ====")
+    log(f"  reason: {info['reason']}  reset_at: {info['reset_at']}")
+    log(f"  glm tokens used: {info['glm_tokens_used']}  judged this run: {info['judged_this_run']}  "
+        f"not judged: {info['not_judged_remaining']} of {len(names)} names")
+    log(f"  judge.json saved; no PubChem calls, no graph writes. Resume after reset_at: "
+        f"{info['resume_command']}")
+    log(f"  details: {CACHE_DIR / RESUME_FILE}")
+    sys.exit(4)
 
 
 # ---------------------------------------------------------------- step 3: PubChem
@@ -511,6 +640,8 @@ async def write_entity(client, name, new_desc):
 
 # ---------------------------------------------------------------- main
 async def run(args):
+    _resume_gate(args.ignore_resume)
+    _glm["max"] = args.max_glm_tokens
     if not ZAI_KEY:
         log("FATAL: ZAI_API_KEY not set.")
         sys.exit(1)
@@ -530,6 +661,8 @@ async def run(args):
     judge_cache = load_judge_cache()
     log(f"[judge] classifying {len(names)} names (Semaphore 2)...")
     verdicts = await judge_all(names, judge_cache, args.refresh)
+    if _glm["stop"]:  # judge.json already saved by judge_all; stop BEFORE any PubChem fetch / graph write
+        _write_resume_and_exit(names)
 
     compounds = [(n, v["canonical"]) for n, v in verdicts.items()
                  if v and v.get("decision") == "compound" and v.get("canonical")]
@@ -813,6 +946,98 @@ async def _selftest_fetch():
         PUBCHEM_MIN_INTERVAL, _sleep = old_int, old_sleep
 
 
+async def _selftest_quota_stop():
+    """Quota detection, stop flag / token budget (no HTTP once stopped), RESUME.json + startup gate."""
+    global CACHE_DIR
+    import tempfile
+    from datetime import timedelta
+    msg = "Usage limit reached for 5 hour. Your limit will reset at 2026-09-29 23:10:05"
+    r1308 = httpx.Response(429, json={"error": {"code": "1308", "message": msg}})
+    assert _zai_quota_error(r1308) == (True, "2026-09-29 23:10:05")
+    assert _zai_quota_error(httpx.Response(429, json={"error": {"code": "1305", "message": "overloaded"}})) == (False, None)
+    r1113 = httpx.Response(429, json={"error": {"code": "1113", "message": "Insufficient balance"}})
+    assert _zai_quota_error(r1113) == (True, None)
+    assert _zai_quota_error(httpx.Response(429, json={"error": {"code": "1234", "message": "Quota exceeded"}}))[0]
+    assert _zai_quota_error(httpx.Response(200, json={"choices": [], "usage": {}})) == (False, None)
+    assert _zai_quota_error(httpx.Response(500, text="oops")) == (False, None)
+
+    old_glm, old_nj = dict(_glm), set(_not_judged)
+    ok = {"choices": [{"message": {"content": "SKIP"}}], "usage": {"total_tokens": 120}}
+
+    async def judge(handler, names):
+        sem = asyncio.Semaphore(2)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return [await judge_one(c, sem, n, {}) for n in names]
+
+    def reset(**kw):
+        _glm.update({"tokens": 0, "max": 0, "stop": None, "reset_at": None, "new": 0}, **kw)
+        _not_judged.clear()
+
+    try:
+        def boom(request):
+            raise AssertionError("HTTP call while stop flag set")
+
+        reset(stop="glm_quota")  # stop flag set: no HTTP, marked not-judged
+        assert await judge(boom, ["Foo Acid"]) == [("Foo Acid", None)] and _not_judged == {"Foo Acid"}
+        reset()
+        calls = []
+
+        def quota(request):
+            calls.append(1)
+            return r1308
+
+        res = await judge(quota, ["Foo Acid", "Bar Acid"])  # 2nd name must not reach z.ai
+        assert res == [("Foo Acid", None), ("Bar Acid", None)] and len(calls) == 1, (res, calls)
+        assert _glm["stop"] == "glm_quota" and _glm["reset_at"] == "2026-09-29 23:10:05"
+        assert _not_judged == {"Foo Acid", "Bar Acid"}
+        reset(max=100)
+        calls.clear()
+
+        def budget(request):
+            calls.append(1)
+            return httpx.Response(200, json=ok)
+
+        res = await judge(budget, ["Foo Acid", "Bar Acid"])  # 120 >= 100: 1st judged, then stop
+        assert res[0][1] == {"decision": "skip", "canonical": None} and res[1][1] is None and len(calls) == 1
+        assert _glm["stop"] == "glm_budget" and _glm["tokens"] == 120 and _not_judged == {"Bar Acid"}
+
+        old_dir, old_argv = CACHE_DIR, sys.argv
+        with tempfile.TemporaryDirectory() as tmp:
+            CACHE_DIR = Path(tmp)
+            try:
+                sys.argv = ["enrich_pubchem.py", "--dry-run"]
+                reset(stop="glm_quota", reset_at="2026-09-29 23:10:05", tokens=5, new=2)
+                _not_judged.add("x")
+                try:
+                    _write_resume_and_exit(["x", "y"])
+                    raise AssertionError("no exit")
+                except SystemExit as e:
+                    assert e.code == 4
+                info = json.loads((CACHE_DIR / RESUME_FILE).read_text(encoding="utf-8"))
+                assert info["reason"] == "glm_quota" and info["not_judged_remaining"] == 1
+                assert info["resume_command"] == "python enrich_pubchem.py --dry-run", info
+                fut = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+                (CACHE_DIR / RESUME_FILE).write_text(json.dumps({"reset_at": fut}), encoding="utf-8")
+                try:
+                    _resume_gate(False)
+                    raise AssertionError("gate did not stop")
+                except SystemExit as e:
+                    assert e.code == 4
+                assert (CACHE_DIR / RESUME_FILE).exists()
+                _resume_gate(True)  # --ignore-resume: proceeds, marker removed
+                assert not (CACHE_DIR / RESUME_FILE).exists()
+                (CACHE_DIR / RESUME_FILE).write_text(json.dumps({"reset_at": "2020-01-01 00:00:00"}), encoding="utf-8")
+                _resume_gate(False)  # reset time passed: resumes
+                assert not (CACHE_DIR / RESUME_FILE).exists()
+            finally:
+                CACHE_DIR, sys.argv = old_dir, old_argv
+    finally:
+        _glm.clear()
+        _glm.update(old_glm)
+        _not_judged.clear()
+        _not_judged.update(old_nj)
+
+
 def _selftest():
     p = _parse_judge
     assert p("COMPOUND: gallium") == {"decision": "compound", "canonical": "gallium"}
@@ -849,6 +1074,7 @@ def _selftest():
                                    "smiles": "C", "mp": "12.0 °C"})) == "12.0 °C"
     assert _block_mp("no block") == "?"
     asyncio.run(_selftest_fetch())
+    asyncio.run(_selftest_quota_stop())
     print("selftest OK")
 
 
@@ -860,6 +1086,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="cap number of candidates (testing)")
     ap.add_argument("--fix-blocks", action="store_true",
                     help="clean existing blocks: strip rule-skipped, rewrite changed (no judge calls; --dry-run = log only)")
+    ap.add_argument("--max-glm-tokens", type=int, default=0,
+                    help="stop cleanly (exit 4) once GLM usage.total_tokens reaches N; 0 = no cap")
+    ap.add_argument("--ignore-resume", action="store_true",
+                    help="start even if RESUME.json says a quota stop is still active")
     args = ap.parse_args()
     if args.selftest:
         _selftest()

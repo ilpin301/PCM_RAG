@@ -9,8 +9,9 @@ description: >-
   MODE=dry (dry-run, no graph writes — ALWAYS do this first on a fresh run),
   MODE=full (real writes via /graph/entity/edit), MODE=fix-dry (--fix-blocks
   --dry-run: log-only cleanup of existing blocks) or MODE=fix (--fix-blocks:
-  real cleanup writes). Optional inputs: LIMIT=<n> (cap candidates, for testing)
-  and REFRESH=yes (re-enrich nodes already marked). PRECONDITION the main agent
+  real cleanup writes). Optional inputs: LIMIT=<n> (cap candidates, for testing),
+  REFRESH=yes (re-enrich nodes already marked) and GLM_TOKEN_BUDGET=<n> (stop
+  cleanly on the z.ai plan quota or after n GLM tokens; exit 4 + RESUME.json). PRECONDITION the main agent
   must ensure before delegating: no ingest is running (the pipeline must be
   IDLE — /graph/entity/edit blocks on a busy pipeline). The main agent does NOT
   need to pre-start anything: this runner itself starts Docker Desktop, the
@@ -38,6 +39,7 @@ main agent has put everything you need in the task prompt.
   - `fix` — pass `--fix-blocks` (real cleanup writes, no ZAI key needed).
 - `LIMIT` — optional integer; if present, pass `--limit <n>` (not meaningful with fix modes).
 - `REFRESH` — optional; if `yes`, pass `--refresh` (re-enrich already-marked nodes).
+- `GLM_TOKEN_BUDGET` — optional integer (dry/full only); if present, pass `--max-glm-tokens <N>`. The script then stops cleanly (exit 4) once GLM has used N tokens.
 
 ## Procedure (do these in order)
 
@@ -107,7 +109,7 @@ main agent has put everything you need in the task prompt.
 
 3. **Build the command.** Base:
    `NO_PROXY='*' python enrich_pubchem.py`
-   Append flags per inputs: `--dry-run` if MODE=dry; `--fix-blocks --dry-run` if MODE=fix-dry; `--fix-blocks` if MODE=fix; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes.
+   Append flags per inputs: `--dry-run` if MODE=dry; `--fix-blocks --dry-run` if MODE=fix-dry; `--fix-blocks` if MODE=fix; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes; `--max-glm-tokens <GLM_TOKEN_BUDGET>` if given.
    Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; pass timeout 600000 to the Bash tool for short runs). A `full` run over the current graph judges ~2123 uncached names (~3 h): launch it in the BACKGROUND with a long timeout, redirect output to `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_pubchem.log`, poll the log, and delete the log file if the script exits with code 0. Tell the main agent in your report that a full finish may need the main agent to carry it beyond your wall-clock. Run ONLY ONE instance at a time.
    The script has its own fail-fast guard: on a write run it exits 3 with `FATAL: Ollama not reachable ...` if Ollama is down. Treat that as a preflight failure, not a script bug.
 
@@ -121,6 +123,21 @@ main agent has put everything you need in the task prompt.
    - Run from NATIVE PowerShell, not Git Bash (msys `tar` fails on `C:\` paths): `& X:\RAG_MAIN\PCM_RAG\rag_sync.ps1 push`. It exports Qdrant snapshots and tars rag_storage to `J:\My Drive\RAG\PCM_RAG\rag_storage.tgz`.
    - A failed push is a FAILURE of the run: quote the error. Never claim the base is backed up without the push's success output AND a fresh tgz: `Get-Item 'J:\My Drive\RAG\PCM_RAG\rag_storage.tgz' | Select-Object Length, LastWriteTime`.
    - If the full run outlives your wall-clock (see step 3), say the push is still owed and the main agent must do it after the run ends.
+
+## Usage limits (GLM quota / Claude session)
+**GLM (z.ai 5-hour rolling limit, weekly/monthly limit, balance).**
+- Pass `--max-glm-tokens <N>` when the main agent gives `GLM_TOKEN_BUDGET`.
+- Exit code 4 = clean stop on GLM quota or budget (`--fix-blocks` never judges, so never exits 4). Read `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RESUME.json` and report: `reason` (`glm_quota` | `glm_budget`), `reset_at`, `glm_tokens_used`, `judged_this_run`, `not_judged_remaining` and `resume_command`. Do NOT retry before `reset_at` (the script refuses to start until then anyway; `--ignore-resume` bypasses that - never use it on your own).
+- Exit 4 always happens BEFORE any PubChem fetch or graph write, so no Drive push is owed for that run. `judge.json` is saved (also every 25 verdicts, so a kill loses little).
+- z.ai 1305 is a concurrency limit, not quota: the script backs off and retries by itself.
+
+**Claude session (5-hour limit).**
+- The enrichment job uses no Claude tokens. Always launch it detached (`run_in_background`) so a Claude session hitting its limit does not stop it. Never poll; wait for the completion notice.
+- BEFORE launching, write `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RUN_STATE.json` with `{started_at, mode, command, log_path, push_owed}`; `push_owed` is `true` for writing modes (full, fix), `false` for dry modes.
+- The next session (or this one when notified of completion) reads the log and `RUN_STATE.json`, reports the result, does the owed Drive push (step 6), then sets `push_owed` to `false`.
+- If the Claude session is close to its limit, hand off (the job keeps running) rather than stopping the job, which would waste progress.
+
+**Resume** = re-run the same command: judged names come from `judge.json`, CIDs from the PubChem cache, and already-enriched nodes are skipped by their marker.
 
 ## If writes fail with HTTP 500
 Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors (`ConnectionError: Failed to connect to Ollama`). Do NOT restart the container. Start/verify Ollama (steps d and f), then re-run (edits are idempotent). LightRAG writes the new description to the graph first and keeps failed vector upserts queued in its memory; the next successful edit flushes them. Confirm via a log line `flush: embedding N vectors` followed by `entity/edit ... 200` in `docker logs --since 10m pcm_rag-lightrag-1`. The first flush right after Ollama starts can itself still fail; a minute later it succeeds.

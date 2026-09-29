@@ -20,6 +20,27 @@ USAGE:
   python enrich_openalex.py --dry-run  # enumerate+extract+search+judge, NO writes
   python enrich_openalex.py --refresh  # re-enrich nodes already marked
   python enrich_openalex.py --limit 10 # cap candidates (testing)
+  python enrich_openalex.py --max-glm-tokens 500000  # stop cleanly at that many GLM tokens
+  python enrich_openalex.py --ignore-resume  # run even if RESUME.json says the quota is still out
+  python enrich_openalex.py --selftest # offline asserts (quota detector, stop flag, resume gate)
+
+USAGE LIMITS (GLM z.ai Coding plan: rolling 5 h quota):
+  On a usage-limit reply (codes 1308/1309/1310, or 1113 balance) or when
+  --max-glm-tokens is reached, no further GLM call is made, caches are flushed,
+  items not reached are left alone (not errors), and enrich_cache/RESUME.json is
+  written (stopped_at, reason glm_quota|glm_budget, reset_at, glm_tokens_used,
+  processed_this_run, remaining, writes_done, resume_command, note). Resume =
+  run the same command again; while reset_at is in the future the startup gate
+  exits 4 without any call. Code 1305 is a concurrency limit: normal backoff.
+  A node is either fully written or untouched: GLM calls happen before the
+  fresh-read + write step, never inside it.
+
+EXIT CODES:
+  0  finished (SUMMARY printed)
+  1  fatal precondition (ZAI_API_KEY / LIGHTRAG_API_KEY missing, graphml missing) or crash
+  2  bad command-line arguments (argparse)
+  4  stopped on GLM quota/budget (STOP block printed, RESUME.json written) or
+     startup gate refused because reset_at is still in the future
 """
 import argparse
 import asyncio
@@ -47,6 +68,7 @@ CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 EXTRACT_CACHE = CACHE_DIR / "extract_openalex.json"
 JUDGE_CACHE = CACHE_DIR / "judge_openalex.json"
 SEARCH_CACHE = CACHE_DIR / "search_openalex.json"
+RESUME = CACHE_DIR / "RESUME.json"
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 
@@ -139,6 +161,96 @@ def _save_json(path, obj):
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------- GLM usage limit (quota / budget stop)
+QUOTA_CODES = {"1308", "1309", "1310", "1113"}  # 1305 = concurrency limit: NOT here, plain backoff
+RESET_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?")
+_state = {"stop": None, "reset_at": "", "tokens": 0, "budget": 0}  # stop: None|"glm_quota"|"glm_budget"
+
+
+class GlmStop(Exception):
+    """GLM quota exhausted or --max-glm-tokens reached: no further GLM calls this run."""
+
+
+def glm_quota_hit(text):
+    """(True, reset_str) if a z.ai error body is a usage-limit/balance exhaustion, else (False, "")."""
+    code = None
+    try:
+        d = json.loads(text)
+        e = d.get("error", d) if isinstance(d, dict) else None
+        if isinstance(e, dict) and e.get("code") is not None:
+            code = str(e["code"])
+    except ValueError:
+        pass
+    if code is None:
+        m = re.search(r'"code"\s*:\s*"?(\d+)', text or "")
+        code = m.group(1) if m else None
+    if code not in QUOTA_CODES:
+        return False, ""
+    m = RESET_RE.search(text)
+    return True, (m.group(0) if m else "")
+
+
+def _set_stop(reason, reset=""):
+    if not _state["stop"]:  # first reason wins
+        _state["stop"], _state["reset_at"] = reason, reset
+
+
+def _glm_gate():
+    """Raise GlmStop before any GLM call once the stop flag is set or the token budget is reached."""
+    if not _state["stop"] and _state["budget"] and _state["tokens"] >= _state["budget"]:
+        _set_stop("glm_budget")
+    if _state["stop"]:
+        raise GlmStop(_state["stop"])
+
+
+def _parse_dt(s):
+    try:
+        return datetime.fromisoformat((s or "").replace(" ", "T"))
+    except ValueError:
+        return None
+
+
+def _write_resume(processed, remaining, writes):
+    reason = _state["stop"]
+    cmd = "NO_PROXY='*' python enrich_openalex.py " + " ".join(sys.argv[1:])
+    if reason == "glm_quota":
+        note = ("z.ai usage limit hit; reset_at is z.ai's own wall-clock text (timezone not "
+                "guaranteed, read as local time). Re-run resume_command after it; caches make the "
+                "replay cheap. No reset_at (e.g. 1113 balance): add funds, then re-run.")
+    else:
+        note = "--max-glm-tokens budget reached; re-run resume_command (the token counter restarts at 0)."
+    _save_json(RESUME, {
+        "stopped_at": datetime.now().isoformat(timespec="seconds"),
+        "reason": reason,
+        "reset_at": _state["reset_at"],
+        "glm_tokens_used": _state["tokens"],
+        "processed_this_run": processed,
+        "remaining": remaining,
+        "writes_done": writes,
+        "resume_command": cmd.strip(),
+        "note": note,
+    })
+
+
+def resume_gate(ignore):
+    """True = blocked (RESUME.json reset_at still in the future). Else consumes RESUME.json and lets the run go on."""
+    if not RESUME.exists():
+        return False
+    try:
+        info = json.loads(RESUME.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        info = {}
+    reset = _parse_dt(info.get("reset_at"))
+    if reset and reset > datetime.now() and not ignore:
+        log(f"[resume-gate] {info.get('reason')} until {info.get('reset_at')} - no GLM calls made. "
+            f"Exit 4 (--ignore-resume to bypass).")
+        return True
+    log(f"[resume] continuing after {info.get('reason', 'unknown')} stop of {info.get('stopped_at')}"
+        + (" (--ignore-resume)" if ignore else ""))
+    RESUME.unlink()
+    return False
+
+
 # ---------------------------------------------------------------- step 1: enumerate
 def enumerate_candidates():
     """ref_text nodes ∪ citation-shaped content nodes, deduped by name.
@@ -188,6 +300,7 @@ EXTRACT_SYSTEM = (
 async def _llm_call(client, sem, messages, max_tokens=4000):
     async with sem:
         for attempt in range(4):
+            _glm_gate()  # stop flag / token budget: no call is made past this point
             try:
                 r = await client.post(
                     f"{ZAI_BASE}/chat/completions",
@@ -200,11 +313,21 @@ async def _llm_call(client, sem, messages, max_tokens=4000):
                     },
                     timeout=120,
                 )
+                if r.status_code != 200 or '"choices"' not in r.text:
+                    hit, reset = glm_quota_hit(r.text)
+                    if hit:
+                        _set_stop("glm_quota", reset)
+                        log(f"[glm] usage limit reached (reset_at={reset or 'unknown'}): {r.text[:200]}")
+                        raise GlmStop("glm_quota")
                 if r.status_code == 429 or "1305" in r.text:
                     await asyncio.sleep(2 * (attempt + 1))  # z.ai concurrency: back off
                     continue
                 r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"].strip()
+                data = r.json()
+                _state["tokens"] += int((data.get("usage") or {}).get("total_tokens") or 0)
+                return data["choices"][0]["message"]["content"].strip()
+            except GlmStop:
+                raise
             except Exception:
                 if attempt == 3:
                     raise
@@ -257,6 +380,8 @@ async def extract_all(names, cands, cache):
                 [{"role": "system", "content": EXTRACT_SYSTEM},
                  {"role": "user", "content": user}],
             )
+        except GlmStop:
+            raise
         except Exception as e:
             log(f"[extract] batch ERROR: {e}")
             out = None
@@ -275,32 +400,44 @@ async def extract_all(names, cands, cache):
         return got
 
     async with httpx.AsyncClient(trust_env=False) as client:
-        for start in range(0, len(todo), EXTRACT_BATCH):
-            batch = todo[start:start + EXTRACT_BATCH]
-            got = await do_batch(client, batch)
-            missing = [n for n in batch if n not in got]
-            if missing:  # batch truncated/unparseable → per-node fallback
-                log(f"[extract] fallback: {len(missing)} nodes retried singly")
-                for n in missing:
-                    got.update(await do_batch(client, [n]))
-            for n in batch:
-                obj = got.get(n)
-                if obj is None:
-                    cache[n] = None
-                else:
-                    year = _valid_year(obj.get("year"))
-                    surname = (obj.get("surname") or "").strip() or None
-                    if year is None or surname is None:
-                        cache[n] = None  # hard requirement: surname + valid year
+        try:
+            for start in range(0, len(todo), EXTRACT_BATCH):
+                batch = todo[start:start + EXTRACT_BATCH]
+                got, stopped = {}, None
+                try:
+                    got = await do_batch(client, batch)
+                    missing = [n for n in batch if n not in got]
+                    if missing:  # batch truncated/unparseable → per-node fallback
+                        log(f"[extract] fallback: {len(missing)} nodes retried singly")
+                        for n in missing:
+                            got.update(await do_batch(client, [n]))
+                except GlmStop as e:
+                    stopped = e  # keep what `got` already holds; the rest stays uncached
+                for n in batch:
+                    obj = got.get(n)
+                    if obj is None:
+                        if stopped is None:
+                            cache[n] = None
+                        # else: not attempted because of the stop -> leave uncached, retried on resume
                     else:
-                        cache[n] = {
-                            "surname": surname,
-                            "year": year,
-                            "venue": (obj.get("venue") or "").strip() or None,
-                            "title_guess": (obj.get("title_guess") or "").strip() or None,
-                            "keywords": (obj.get("keywords") or "").strip(),
-                        }
-            _save_json(EXTRACT_CACHE, cache)
+                        year = _valid_year(obj.get("year"))
+                        surname = (obj.get("surname") or "").strip() or None
+                        if year is None or surname is None:
+                            cache[n] = None  # hard requirement: surname + valid year
+                        else:
+                            cache[n] = {
+                                "surname": surname,
+                                "year": year,
+                                "venue": (obj.get("venue") or "").strip() or None,
+                                "title_guess": (obj.get("title_guess") or "").strip() or None,
+                                "keywords": (obj.get("keywords") or "").strip(),
+                            }
+                _save_json(EXTRACT_CACHE, cache)  # every batch (<=20 new results)
+                if stopped is not None:
+                    raise stopped
+        finally:
+            if todo:
+                _save_json(EXTRACT_CACHE, cache)
     return {n: cache.get(n) for n in names}
 
 
@@ -415,6 +552,8 @@ async def judge_one(client, sem, name, desc, cands_list, cache):
              {"role": "user", "content": "\n".join(lines)}],
             max_tokens=200,
         )
+    except GlmStop:
+        raise
     except Exception as e:
         log(f"[judge] ERROR {name!r}: {e}")
         return None
@@ -503,10 +642,12 @@ async def write_entity(client, name, new_desc):
 
 # ---------------------------------------------------------------- main
 async def run(args):
+    """Returns the process exit code: 0 finished, 4 stopped on GLM quota/budget."""
     if not ZAI_KEY:
         log("FATAL: ZAI_API_KEY not set.")
         sys.exit(1)
 
+    _state["budget"] = max(0, args.max_glm_tokens)
     stats = {"enriched": 0, "skipped_judge": 0, "unresolved": 0,
              "hard_rule_reject": 0, "gone": 0, "already": 0, "error": 0}
 
@@ -517,94 +658,215 @@ async def run(args):
         log(f"[limit] capped to {len(names)} candidates")
 
     extract_cache = _load_json(EXTRACT_CACHE)
-    extracted = await extract_all(names, cands, extract_cache)
-    n_ext = sum(1 for v in extracted.values() if v)
-    log(f"[extract] {n_ext} extractable, {len(names) - n_ext} unresolved at extraction")
-
     judge_cache = _load_json(JUDGE_CACHE)
     search_cache = _load_json(SEARCH_CACHE)
     sem = asyncio.Semaphore(2)
-    processed = 0
+    processed = 0  # nodes fully handled this run (a node cut off by the stop is NOT counted)
+    writes = 0     # successful /graph/entity/edit calls
+    n_ext = 0
 
-    async with httpx.AsyncClient(trust_env=False) as client:
-        async def _process_one(name):
-            ext = extracted.get(name)
-            if not ext:
-                log(f"[unresolved] {name!r} (extraction)")
-                stats["unresolved"] += 1
-                return
+    try:
+        extracted = await extract_all(names, cands, extract_cache)
+        n_ext = sum(1 for v in extracted.values() if v)
+        log(f"[extract] {n_ext} extractable, {len(names) - n_ext} unresolved at extraction")
 
-            # skip-check: already enriched (unless --refresh)
-            if not args.refresh:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            async def _process_one(name):
+                nonlocal writes
+                ext = extracted.get(name)
+                if not ext:
+                    log(f"[unresolved] {name!r} (extraction)")
+                    stats["unresolved"] += 1
+                    return
+
+                # skip-check: already enriched (unless --refresh)
+                if not args.refresh:
+                    desc = await fresh_description(client, name)
+                    if desc is None:
+                        log(f"[gone] {name!r}")
+                        stats["gone"] += 1
+                        return
+                    if MARK_START in desc:
+                        log(f"[already] {name!r}")
+                        stats["already"] += 1
+                        return
+
+                works = await openalex_search(client, ext, search_cache, name)
+                if not works:
+                    log(f"[unresolved] {name!r} (no OpenAlex hits)")
+                    stats["unresolved"] += 1
+                    return
+
+                # last GLM call for this node; a GlmStop here leaves the node untouched
+                verdict = await judge_one(
+                    client, sem, name, cands[name]["description"], works, judge_cache
+                )
+                if not verdict or verdict.get("decision") != "match":
+                    log(f"[skipped_judge] {name!r}")
+                    stats["skipped_judge"] += 1
+                    return
+                work = works[verdict["pick"]]
+                if not _hard_rules_ok(ext, work):
+                    log(f"[hard_rule_reject] {name!r} -> {work['id']} "
+                        f"(year/surname gate)")
+                    stats["hard_rule_reject"] += 1
+                    return
+
+                block = format_block(work)
+                if args.dry_run:
+                    log(f"[dry-run] would enrich {name!r} -> {work['id']} "
+                        f'"{work["title"][:60]}" ({work["year"]})')
+                    stats["enriched"] += 1
+                    return
+
+                # fresh read immediately before write (avoid stale clobber)
                 desc = await fresh_description(client, name)
                 if desc is None:
                     log(f"[gone] {name!r}")
                     stats["gone"] += 1
                     return
-                if MARK_START in desc:
-                    log(f"[already] {name!r}")
-                    stats["already"] += 1
-                    return
-
-            works = await openalex_search(client, ext, search_cache, name)
-            if not works:
-                log(f"[unresolved] {name!r} (no OpenAlex hits)")
-                stats["unresolved"] += 1
-                return
-
-            verdict = await judge_one(
-                client, sem, name, cands[name]["description"], works, judge_cache
-            )
-            if not verdict or verdict.get("decision") != "match":
-                log(f"[skipped_judge] {name!r}")
-                stats["skipped_judge"] += 1
-                return
-            work = works[verdict["pick"]]
-            if not _hard_rules_ok(ext, work):
-                log(f"[hard_rule_reject] {name!r} -> {work['id']} "
-                    f"(year/surname gate)")
-                stats["hard_rule_reject"] += 1
-                return
-
-            block = format_block(work)
-            if args.dry_run:
-                log(f"[dry-run] would enrich {name!r} -> {work['id']} "
-                    f'"{work["title"][:60]}" ({work["year"]})')
+                stripped = BLOCK_RE.sub("", desc).rstrip()
+                new_desc = (stripped + "\n\n" + block) if stripped else block
+                await write_entity(client, name, new_desc)
+                writes += 1
+                log(f"[enriched] {name!r} -> {work['id']} ({work['year']})")
                 stats["enriched"] += 1
-                return
 
-            # fresh read immediately before write (avoid stale clobber)
-            desc = await fresh_description(client, name)
-            if desc is None:
-                log(f"[gone] {name!r}")
-                stats["gone"] += 1
-                return
-            stripped = BLOCK_RE.sub("", desc).rstrip()
-            new_desc = (stripped + "\n\n" + block) if stripped else block
-            await write_entity(client, name, new_desc)
-            log(f"[enriched] {name!r} -> {work['id']} ({work['year']})")
-            stats["enriched"] += 1
+            for name in names:
+                processed += 1
+                if processed == 21 and stats["enriched"] == 0:
+                    log("!!!! WARNING: 0 enriched after first 20 candidates — "
+                        "likely systemic extraction/judge failure. Check prompts/API.")
+                try:
+                    await asyncio.wait_for(_process_one(name), timeout=240)
+                except GlmStop:
+                    processed -= 1  # cut off by the stop: not processed, not an error
+                    break
+                except asyncio.TimeoutError:
+                    log(f"[timeout] {name!r} (skipped after 240s)")
+                    stats["error"] += 1
+                except Exception as e:
+                    log(f"[error] {name!r}: {e}")
+                    stats["error"] += 1
+    except GlmStop:
+        pass  # stopped during extraction: no node was processed
+    finally:
+        # flush every cache (per-result saves already happen; this covers any exit path)
+        _save_json(EXTRACT_CACHE, extract_cache)
+        _save_json(JUDGE_CACHE, judge_cache)
+        _save_json(SEARCH_CACHE, search_cache)
 
-        for name in names:
-            processed += 1
-            if processed == 21 and stats["enriched"] == 0:
-                log("!!!! WARNING: 0 enriched after first 20 candidates — "
-                    "likely systemic extraction/judge failure. Check prompts/API.")
-            try:
-                await asyncio.wait_for(_process_one(name), timeout=240)
-            except asyncio.TimeoutError:
-                log(f"[timeout] {name!r} (skipped after 240s)")
-                stats["error"] += 1
-            except Exception as e:
-                log(f"[error] {name!r}: {e}")
-                stats["error"] += 1
+    if _state["stop"]:
+        remaining = len(names) - processed
+        _write_resume(processed, remaining, writes)
+        log("\n==== STOP ====")
+        log(f"  reason: {_state['stop']}  reset_at: {_state['reset_at'] or 'unknown'}")
+        log(f"  glm_tokens_used: {_state['tokens']}  processed_this_run: {processed}  "
+            f"remaining: {remaining}  writes_done: {writes}")
+        for k, v in stats.items():
+            log(f"  {k}: {v}")
+        log(f"  resume: re-run the same command after reset_at (state in {RESUME})")
+        return 4
 
     log("\n==== SUMMARY ====")
     for k, v in stats.items():
         log(f"  {k}: {v}")
-    log(f"  candidates: {len(names)}  extractable: {n_ext}")
+    log(f"  candidates: {len(names)}  extractable: {n_ext}  glm_tokens_used: {_state['tokens']}")
     if args.dry_run:
         log("  (dry-run: no writes performed)")
+    return 0
+
+
+# ---------------------------------------------------------------- offline self-check
+def selftest():
+    import tempfile
+    global CACHE_DIR, RESUME
+
+    # 1. quota detector
+    body = ('{"error":{"code":"1308","message":"Usage limit reached for 5 hour. '
+            'Your limit will reset at 2026-09-29 23:10:05"}}')
+    assert glm_quota_hit(body) == (True, "2026-09-29 23:10:05")
+    assert glm_quota_hit('{"error":{"code":"1305","message":"concurrency"}}') == (False, "")
+    assert glm_quota_hit('{"error":{"code":"1113","message":"Insufficient balance"}}') == (True, "")
+    assert glm_quota_hit('{"error":{"code":1309,"message":"limit, reset at 2026-10-01T00:05"}}') == (True, "2026-10-01T00:05")
+    assert glm_quota_hit("not json but \"code\": \"1310\"")[0] is True
+    assert glm_quota_hit("") == (False, "")
+
+    # 2. no GLM call once the stop flag is set / budget reached (mock transport fails if called)
+    calls = []
+    mode = {"m": "ok"}
+
+    def handler(req):
+        calls.append(1)
+        if mode["m"] == "forbidden":
+            raise AssertionError("GLM call made while stopped")
+        if mode["m"] == "quota":
+            return httpx.Response(429, text=body)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "SKIP"}}],
+                                         "usage": {"total_tokens": 7}})
+
+    def reset(budget=0):
+        _state.update(stop=None, reset_at="", tokens=0, budget=budget)
+        calls.clear()
+        mode["m"] = "ok"
+
+    async def go():
+        sem = asyncio.Semaphore(2)
+        msgs = [{"role": "user", "content": "x"}]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            # token accumulation + budget stop
+            reset(budget=10)
+            assert await _llm_call(c, sem, msgs) == "SKIP" and _state["tokens"] == 7
+            assert await _llm_call(c, sem, msgs) == "SKIP" and _state["tokens"] == 14
+            mode["m"] = "forbidden"
+            try:
+                await _llm_call(c, sem, msgs)
+                raise AssertionError("budget did not stop")
+            except GlmStop:
+                pass
+            assert _state["stop"] == "glm_budget" and len(calls) == 2
+            # quota reply -> stop with reset_at; afterwards no further call
+            reset()
+            mode["m"] = "quota"
+            try:
+                await _llm_call(c, sem, msgs)
+                raise AssertionError("quota did not stop")
+            except GlmStop:
+                pass
+            assert _state["stop"] == "glm_quota" and _state["reset_at"] == "2026-09-29 23:10:05"
+            n = len(calls)
+            mode["m"] = "forbidden"
+            jc = {}
+            cand = [{"authors": ["A"], "title": "t", "venue": "v", "year": 2020, "doi": ""}]
+            try:
+                await judge_one(c, sem, "n", "d", cand, jc)  # judge_one must not swallow the stop
+                raise AssertionError("judge_one swallowed the stop")
+            except GlmStop:
+                pass
+            assert len(calls) == n and jc == {}
+
+    asyncio.run(go())
+
+    # 3. RESUME.json write + startup gate (temp dir, real files untouched)
+    with tempfile.TemporaryDirectory() as td:
+        CACHE_DIR = Path(td)
+        RESUME = CACHE_DIR / "RESUME.json"
+        reset()
+        _set_stop("glm_quota", "2999-01-01 00:00:00")
+        _write_resume(3, 7, 2)
+        info = json.loads(RESUME.read_text(encoding="utf-8"))
+        assert info["reason"] == "glm_quota" and info["remaining"] == 7 and info["writes_done"] == 2
+        assert resume_gate(False) is True and RESUME.exists()      # future reset -> blocked, kept
+        assert resume_gate(True) is False and not RESUME.exists()  # --ignore-resume -> consumed
+        reset()
+        _set_stop("glm_quota", "2000-01-01 00:00:00")
+        _write_resume(0, 1, 0)
+        assert resume_gate(False) is False and not RESUME.exists()  # past reset -> resume
+        reset()
+        _set_stop("glm_budget")
+        _write_resume(0, 1, 0)
+        assert resume_gate(False) is False and not RESUME.exists()  # budget stop has no reset
+    log("SELFTEST OK")
 
 
 def main():
@@ -612,8 +874,18 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="extract+search+judge, no graph writes")
     ap.add_argument("--refresh", action="store_true", help="re-enrich nodes already marked")
     ap.add_argument("--limit", type=int, default=0, help="cap number of candidates (testing)")
+    ap.add_argument("--max-glm-tokens", type=int, default=0,
+                    help="stop cleanly once this many GLM tokens were used this run (0 = no cap)")
+    ap.add_argument("--ignore-resume", action="store_true",
+                    help="run even if RESUME.json says the GLM quota is still exhausted")
+    ap.add_argument("--selftest", action="store_true", help="offline asserts, no network, then exit")
     args = ap.parse_args()
-    asyncio.run(run(args))
+    if args.selftest:
+        selftest()
+        return
+    if resume_gate(args.ignore_resume):
+        sys.exit(4)
+    sys.exit(asyncio.run(run(args)))
 
 
 if __name__ == "__main__":
