@@ -11,8 +11,12 @@ description: >-
   run) or MODE=full (real writes via /graph/entity/edit). Optional inputs:
   LIMIT=<n> (cap candidates, for testing) and REFRESH=yes (re-enrich nodes
   already marked). PRECONDITION the main agent must ensure before delegating:
-  the LightRAG server is UP and IDLE (no ingest running — /graph/entity/edit
-  blocks on a busy pipeline). ZAI_API_KEY is read from .env by the subagent — the main agent does NOT need to pass it. Default
+  no ingest is running (the pipeline must be IDLE — /graph/entity/edit blocks
+  on a busy pipeline). The main agent does NOT need to pre-start anything: this
+  runner itself starts Docker Desktop, the compose services (LightRAG + Qdrant)
+  and Ollama when they are down, like the il-rag-ingest Step 0 preflight, and
+  verifies the container can reach Ollama before any write.
+  ZAI_API_KEY is read from .env by the subagent — the main agent does NOT need to pass it. Default
   recommended flow: first delegate MODE=dry LIMIT=10, relay the summary, let the
   user eyeball which nodes resolve to which OpenAlex work, and only then
   delegate MODE=full on the user's OK. The run is resumable/idempotent: re-runs
@@ -33,15 +37,50 @@ main agent has put everything you need in the task prompt.
 
 ## Procedure (do these in order)
 
-1. **Preconditions.** Run, from `X:\RAG_MAIN\PCM_RAG\lightrag`:
-   - Server health:
-     `$key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim(); curl.exe -s http://127.0.0.1:9622/health -H "X-API-Key: $key"`
-     If it does not return a healthy/OK JSON, STOP and report "server not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
-   - Qdrant health (vectors live in Qdrant since the 2026-09-09 migration; LightRAG can be up while Qdrant is down, and the entity edit then fails mid-run at the vector upsert):
-     `curl.exe -s http://127.0.0.1:6333/readyz`
-     If it does not return a ready response, STOP and report "qdrant not up — start it with `docker compose up -d` in lightrag/". Do NOT start it yourself.
-   - **Docker Desktop daemon must be running.** If `curl http://127.0.0.1:9622/health` fails to connect (curl exit / http 000) AND `docker ps` errors with "cannot connect to the Docker API / daemon not running", the Docker Desktop daemon is down. STOP and report: "Docker Desktop not running — the main agent should start it (`C:\Program Files\Docker\Docker\Docker Desktop.exe`), wait for the daemon, then `docker compose up -d` in lightrag/." Do NOT start Docker yourself.
-   - **Ollama must be running (REQUIRED for writes).** Check `curl -s http://127.0.0.1:11434/api/tags` returns JSON listing `bge-m3:latest`. If Ollama is DOWN, every `/graph/entity/edit` write returns HTTP 500 with server-side `ConnectionError: Failed to connect to Ollama` — because the write path re-embeds the updated node text via bge-m3 at host.docker.internal:11434. READS work without Ollama; only WRITES need it, so a dry-run can pass while a full run 500s on every node. STOP a full run and report if Ollama is down (main agent starts `C:\Users\il720506\AppData\Local\Programs\Ollama\ollama app.exe`). Do NOT start Ollama yourself.
+1. **Preconditions (self-starting preflight, same approach as il-rag-ingest Step 0).** Use PowerShell (`powershell -NoProfile -Command ...` if you only have Bash). Use `127.0.0.1`, never `localhost`. From `X:\RAG_MAIN\PCM_RAG\lightrag`:
+   - **Ingest-in-flight check FIRST, independent of /health** (during an ingest the launcher STOPS the lightrag service, so /health failing does not mean "start it"). STOP and report "ingest in flight" and start NOTHING (no Docker, compose or Ollama) if either holds:
+     - `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\ingest_run.log` exists and contains no line starting with `EXITCODE=`;
+     - a process whose command line contains `ingest.ps1`, `rag_ingest.py` or `ingest_merged.py` is running:
+       `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'ingest\.ps1|rag_ingest\.py|ingest_merged\.py' }`
+     A log that exists WITH an `EXITCODE=` line is a finished run (failed runs keep their log) and does not block.
+   - **Docker Desktop down => start it yourself.**
+     ```powershell
+     docker info *> $null
+     if ($LASTEXITCODE -ne 0) {
+       Start-Process (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe')
+       $deadline = (Get-Date).AddMinutes(4)
+       do { Start-Sleep 5; docker info *> $null } until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $deadline)
+       if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop did not come up - stop and report' }
+     }
+     ```
+   - **Compose services (LightRAG + Qdrant).** Bring them up (no-op when already up) and wait up to 3 min for `/health` (9622, with `X-API-Key`) and Qdrant `http://127.0.0.1:6333/readyz`. Vectors live in Qdrant since 2026-09-09; an edit fails mid-run at the vector upsert when it is down:
+     ```powershell
+     $key = (Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^LIGHTRAG_API_KEY=').Line.Split('=',2)[1].Trim()
+     docker compose --project-directory X:\RAG_MAIN\PCM_RAG\lightrag up -d
+     $deadline = (Get-Date).AddMinutes(3)
+     while (-not ((curl.exe -s http://127.0.0.1:9622/health -H "X-API-Key: $key") -and (curl.exe -s http://127.0.0.1:6333/readyz)) -and (Get-Date) -lt $deadline) { Start-Sleep 5 }
+     ```
+     Only STOP and report if either still does not answer after the wait.
+   - **Ollama down => start it yourself (REQUIRED for writes).** An empty reply from `curl.exe -s http://127.0.0.1:11434/api/version` means it is not running. If it is DOWN, every `/graph/entity/edit` write returns HTTP 500 with server-side `ConnectionError: Failed to connect to Ollama` — because the write path re-embeds the updated node text via bge-m3 at host.docker.internal:11434. READS work without Ollama; only WRITES need it, so a dry-run can pass while a full run 500s on every node.
+     ```powershell
+     if (-not (curl.exe -s http://127.0.0.1:11434/api/version)) {
+       $ollama = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+       if (-not $ollama) { $ollama = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe' }
+       Start-Process $ollama -ArgumentList 'serve' -WindowStyle Hidden
+       $deadline = (Get-Date).AddSeconds(90)
+       while (-not (curl.exe -s http://127.0.0.1:11434/api/version) -and (Get-Date) -lt $deadline) { Start-Sleep 3 }
+       if (-not (curl.exe -s http://127.0.0.1:11434/api/version)) { throw 'Ollama did not come up - stop and report' }
+     }
+     ```
+   - **Pipeline must be IDLE:** `curl.exe -s http://127.0.0.1:9622/documents/pipeline_status -H "X-API-Key: $key"` must show `busy` false, else STOP and report "pipeline busy".
+   - **THEN verify the container reaches Ollama** (retry up to 60 s — the first embed right after Ollama starts can still fail). Must print `200`; required for `full` runs:
+     ```powershell
+     $deadline = (Get-Date).AddSeconds(60); $st = ''
+     do { $st = docker exec pcm_rag-lightrag-1 python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:11434/api/tags',timeout=5).status)" 2>$null
+          if ($st -ne '200') { Start-Sleep 5 } } until ($st -eq '200' -or (Get-Date) -gt $deadline)
+     if ($st -ne '200') { throw 'container cannot reach Ollama - stop and report' }
+     ```
+     Only STOP and report if it is still not 200 after the wait.
    - ZAI key: read from `.env` (READ-ONLY — never write, append, or rotate any key, and never hardcode a key literal anywhere):
      ```powershell
      $hit = Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\.env | Select-String '^(ZAI_API_KEY|LLM_BINDING_API_KEY)=' | Select-Object -First 1
@@ -62,7 +101,7 @@ main agent has put everything you need in the task prompt.
      ```
      - If `$oa_code` is `429`: get the Retry-After header, compute reset hours, STOP immediately. Report: "OpenAlex budget exhausted. Resets in ~X hours (midnight UTC). Do not run — resume after reset."
      - If `$oa_code` is `200`: budget available, proceed.
-   - Remind (in your final report, not a blocker you can verify): a real (`full`) run needs the pipeline IDLE — no ingest running.
+   - Ingest-in-flight and pipeline-idle are verified above; do not start or stop any ingest.
 
 2. **Build the command.** Base:
    `NO_PROXY='*' python enrich_openalex.py`
@@ -131,6 +170,9 @@ OpenAlex meters a free daily budget (~$0.10 / 1000 credits, ~$0.001 per /works s
 
 4. **Do NOT blind-retry on failure.** The script self-retries only TRANSIENT OpenAlex 429/503 and z.ai 1305 internally (bounded ~4 attempts), and all LLM/search results are cached to disk, so a re-run after a crash is cheap — but the decision to re-run belongs to the main agent, not you. A **BUDGET 429** ("Insufficient budget / Resets at midnight UTC") is NOT transient: retrying or restarting is futile until the UTC reset or funds are added — see the "OpenAlex daily budget" section above. If it exits non-zero or throws, report the actual error text.
 
+## If writes fail with HTTP 500
+Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors (`ConnectionError: Failed to connect to Ollama`). Do NOT restart the container. Start/verify Ollama (the Ollama and container-reach steps in Preconditions), then re-run (edits are idempotent). LightRAG writes the new description to the graph first and keeps failed vector upserts queued in its memory; the next successful edit flushes them. Confirm via a log line `flush: embedding N vectors` followed by `entity/edit ... 200` in `docker logs --since 10m pcm_rag-lightrag-1`. The first flush right after Ollama starts can itself still fail; a minute later it succeeds.
+
 ## Report back (concise)
 - MODE run and exact command used.
 - The SUMMARY counts (enriched / skipped_judge / unresolved / hard_rule_reject / gone / already / error / timeout) and candidates/extractable totals.
@@ -139,7 +181,7 @@ OpenAlex meters a free daily budget (~$0.10 / 1000 credits, ~$0.001 per /works s
 - Any precondition failure, budget-429 STOP, or error, quoted exactly.
 
 ## Hard rules
-- Never start/stop the Docker server, Docker Desktop, Ollama, or any ingest yourself.
+- You may START Docker Desktop, the compose services and Ollama as in the preflight. Never STOP or restart the lightrag container (queued vector updates live in its memory until a successful flush). Never start or stop an ingest.
 - Never invent API keys, and never write a key literal into any file. Keys are READ from `.env` only.
 - On a fresh enrichment, prefer MODE=dry first if the main agent gave you a choice; but always obey the MODE you were given.
 - Run only ONE instance of the script at a time.

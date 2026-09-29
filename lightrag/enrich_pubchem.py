@@ -10,13 +10,16 @@ block, never stack.
 PRECONDITIONS:
   - LightRAG server UP and IDLE (no ingest running) at LIGHTRAG_URL.
   - ZAI_API_KEY set (glm-5.3 judge via z.ai).
-  - Ollama not required (no embedding done here; server re-embeds on edit).
+  - Ollama UP at OLLAMA_URL for any write run (the server re-embeds edited descriptions;
+    checked fail-fast, exit 3). Not needed for --dry-run / --selftest.
 
 USAGE:
   python enrich_pubchem.py            # full run (writes to graph)
   python enrich_pubchem.py --dry-run  # enumerate+judge+fetch, NO writes
   python enrich_pubchem.py --refresh  # re-enrich nodes already marked
   python enrich_pubchem.py --limit 10 # cap candidates (testing)
+  python enrich_pubchem.py --fix-blocks            # clean existing blocks (strip/rewrite), needs no ZAI key
+  python enrich_pubchem.py --fix-blocks --dry-run  # same, log only, NO writes
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
 """
 import argparse
@@ -42,7 +45,7 @@ SCRIPT_DIR = Path(__file__).parent
 GRAPHML = SCRIPT_DIR / "data" / "rag_storage" / "graph_chunk_entity_relation.graphml"
 CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
-FACTS_VERSION = 2  # bump when fact parsing changes; stale-version CID cache files are re-fetched
+FACTS_VERSION = 3  # bump when fact parsing changes; stale-version CID cache files are re-fetched
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 def _load_lightrag_key():
@@ -59,6 +62,8 @@ def _load_lightrag_key():
 
 
 LIGHTRAG_KEY = _load_lightrag_key()
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 
 ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_BASE = "https://api.z.ai/api/coding/paas/v4"
@@ -102,13 +107,29 @@ def log(msg):
     print(msg, flush=True)
 
 
+def require_ollama():
+    """Fail fast before any graph write: the server embeds edited descriptions via Ollama, and with
+    Ollama down the graph is written but the vector upserts stay queued in the server's memory."""
+    try:
+        httpx.get(f"{OLLAMA_URL}/api/version", timeout=5, trust_env=False).raise_for_status()
+    except Exception:
+        log(f"FATAL: Ollama not reachable at {OLLAMA_URL} - the server needs it to embed "
+            "edited descriptions; start Ollama first")
+        sys.exit(3)
+
+
 # ---------------------------------------------------------------- step 1: enumerate
-def _find_type_key(root):
-    """graphml <key> id for node attr 'entity_type', or None."""
+def _find_key(root, attr_name):
+    """graphml <key> id for node attr `attr_name`, or None."""
     for k in root.iter(GRAPHML_NS + "key"):
-        if k.get("for") == "node" and k.get("attr.name") == "entity_type":
+        if k.get("for") == "node" and k.get("attr.name") == attr_name:
             return k.get("id")
     return None
+
+
+def _find_type_key(root):
+    """graphml <key> id for node attr 'entity_type', or None."""
+    return _find_key(root, "entity_type")
 
 
 def enumerate_candidates():
@@ -186,9 +207,10 @@ RULE_SKIP_RE = re.compile(
 
 
 def _rule_skip(name):
-    """Deterministic pre-judge skip: ambiguous <=2-char symbols, cement hydration phases."""
+    """Deterministic pre-judge skip: single-char names (ambiguous), cement hydration phases.
+    Two-char names stay allowed: they include real elements (Cu, Ge, Sb, Te, Si, Se, Sn, Bi)."""
     n = (name or "").strip()
-    return len(n) <= 2 or bool(RULE_SKIP_RE.search(n))
+    return len(n) == 1 or bool(RULE_SKIP_RE.search(n))
 
 
 async def judge_one(client, sem, name, cache, refresh=False):
@@ -260,32 +282,55 @@ async def judge_all(names, cache, refresh=False):
 
 
 # ---------------------------------------------------------------- step 3: PubChem
+async def _sleep(s):
+    """All PubChem waits go through here so the selftest can stub them."""
+    await asyncio.sleep(s)
+
+
 async def _throttle():
     global _last_pubchem_call
     now = time.monotonic()
     wait = PUBCHEM_MIN_INTERVAL - (now - _last_pubchem_call)
     if wait > 0:
-        await asyncio.sleep(wait)
+        await _sleep(wait)
     _last_pubchem_call = time.monotonic()
 
 
+RETRY_STATUS = (429, 500, 502, 503, 504)
+PUBCHEM_ATTEMPTS = 5
+
+
+def _fault_code(r):
+    """PubChem answers throttled/failed calls with a Fault body (any status). Code str, or None."""
+    try:
+        fault = r.json().get("Fault")
+        return str(fault.get("Code", "")) if isinstance(fault, dict) else None
+    except (ValueError, AttributeError):
+        return None
+
+
 async def _pubchem_get(client, url):
-    """JSON dict; None = 404 (unresolved); FetchFailed = retries exhausted."""
-    for attempt in range(4):
+    """JSON dict; None = 404 / Fault NotFound (genuine not-found); FetchFailed = retries exhausted.
+    Any other Fault body (ServerBusy, Timeout, ServerError...) is retried, never passed through."""
+    for attempt in range(PUBCHEM_ATTEMPTS):
         await _throttle()
+        backoff = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 s
         try:
             r = await client.get(url, headers=PUBCHEM_HEADERS, timeout=60)
         except httpx.TransportError:  # includes timeouts
-            await asyncio.sleep(2 * (attempt + 1))
+            await _sleep(backoff)
             continue
         if r.status_code == 404:
             return None
-        if r.status_code in (429, 503):
+        fault = _fault_code(r)
+        if fault is not None and "NotFound" in fault:
+            return None
+        if r.status_code in RETRY_STATUS or fault is not None:
             try:
-                retry = int(r.headers.get("Retry-After", 2 * (attempt + 1)))
+                retry = int(r.headers.get("Retry-After", backoff))
             except ValueError:  # HTTP-date form
-                retry = 2 * (attempt + 1)
-            await asyncio.sleep(retry)
+                retry = backoff
+            await _sleep(retry)
             continue
         r.raise_for_status()
         return r.json()
@@ -348,12 +393,12 @@ async def pubchem_fetch(client, canonical):
     cid_json = await _pubchem_get(
         client, f"{PUBCHEM}/rest/pug/compound/name/{httpx.URL(canonical)}/cids/JSON"
     )
-    if not cid_json:
+    if cid_json is None:
         return None
     try:
         cids = cid_json["IdentifierList"]["CID"]
-    except (KeyError, TypeError):
-        return None
+    except (KeyError, TypeError):  # e.g. a Fault body: throttled/odd reply, NOT not-found
+        raise FetchFailed(f"no IdentifierList for {canonical!r}: {str(cid_json)[:120]}")
     if not cids:
         return None
     cid = cids[0]
@@ -375,23 +420,29 @@ async def pubchem_fetch(client, canonical):
         client,
         f"{PUBCHEM}/rest/pug_view/data/compound/{cid}/JSON?heading=Melting+Point",
     )
+    # a reply lacking the expected structure is a failed fetch, never an empty value (and never cached)
     try:
         p = prop["PropertyTable"]["Properties"][0]
     except (KeyError, IndexError, TypeError):
-        return None
-    synonyms = []
+        raise FetchFailed(f"malformed properties for CID {cid}: {str(prop)[:120]}")
+    synonyms = []  # a synonyms 404 (None) is allowed and means []
+    if syn is not None:
+        try:
+            synonyms = syn["InformationList"]["Information"][0]["Synonym"]
+        except (KeyError, IndexError, TypeError):
+            raise FetchFailed(f"malformed synonyms for CID {cid}: {str(syn)[:120]}")
     try:
-        synonyms = syn["InformationList"]["Information"][0]["Synonym"]
-    except (KeyError, IndexError, TypeError):
-        synonyms = []
+        mp_text = _parse_mp(mp)
+    except (AttributeError, TypeError, ValueError):  # malformed pug_view = no melting point
+        mp_text = "not available"
     facts = {
         "v": FACTS_VERSION,
         "cid": cid,
         "formula": p.get("MolecularFormula", ""),
         "mw": p.get("MolecularWeight", ""),
         "iupac": p.get("IUPACName", ""),
-        "smiles": p.get("CanonicalSMILES", ""),
-        "mp": _parse_mp(mp),
+        "smiles": p.get("CanonicalSMILES") or p.get("ConnectivitySMILES") or "",
+        "mp": mp_text,
         "synonyms": synonyms,
         "query": canonical,
     }
@@ -463,6 +514,8 @@ async def run(args):
     if not ZAI_KEY:
         log("FATAL: ZAI_API_KEY not set.")
         sys.exit(1)
+    if not args.dry_run:
+        require_ollama()
 
     stats = {"enriched": 0, "skipped_judge": 0, "judge_error": 0, "unresolved": 0,
              "fetch_failed": 0, "gone": 0, "already": 0, "error": 0}
@@ -551,7 +604,215 @@ async def run(args):
             log(f"    {n!r}")
 
 
+MP_TEXT_RE = re.compile(r"Melting point (.*?)\. Source:", re.DOTALL)
+
+
+def _block_mp(block):
+    """Melting-point text of a PubChem block, '?' if absent."""
+    m = MP_TEXT_RE.search(block or "")
+    return m.group(1).strip() if m else "?"
+
+
+def _marked_names():
+    """Node names whose graphml description contains MARK_START."""
+    if not GRAPHML.exists():
+        log(f"FATAL: graphml not found at {GRAPHML}")
+        sys.exit(1)
+    root = ET.parse(GRAPHML).getroot()
+    k_desc = _find_key(root, "description")
+    if not k_desc:
+        log("FATAL: no node <key> with attr.name='description' in graphml")
+        sys.exit(1)
+    names = []
+    for node in root.iter(GRAPHML_NS + "node"):
+        name = node.get("id")
+        for data in node.findall(GRAPHML_NS + "data"):
+            if data.get("key") == k_desc:
+                if name and MARK_START in (data.text or ""):
+                    names.append(name)
+                break
+    return names
+
+
+async def fix_blocks(args):
+    """Clean existing PubChem blocks: strip ONLY rule-skipped nodes, rewrite changed blocks,
+    keep unjudged and unresolved. No judge calls, no ZAI key. Backs up descriptions before writes."""
+    stats = {k: 0 for k in ("marked", "strip", "rewrite", "same", "keep_unjudged",
+                            "keep_unresolved", "block_only", "fetch_failed", "gone", "nomarker", "error")}
+    error_names = []
+    backup = {}
+    backup_file = CACHE_DIR / f"fixblocks_backup_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    suffix = " (dry-run)" if args.dry_run else ""
+    if not args.dry_run:
+        require_ollama()
+
+    names = _marked_names()
+    stats["marked"] = len(names)
+    log(f"[fix] {len(names)} nodes carry a PubChem block")
+    cache = load_judge_cache()
+
+    async with httpx.AsyncClient(trust_env=False) as client:
+        for name in names:
+            try:
+                desc = await fresh_description(client, name)
+                if desc is None:
+                    log(f"[fix:gone] {name!r}")
+                    stats["gone"] += 1
+                    continue
+                if MARK_START not in desc:
+                    log(f"[fix:nomarker] {name!r}")
+                    stats["nomarker"] += 1
+                    continue
+
+                new_block = None
+                if _rule_skip(name):
+                    reason = "rule-skip"
+                else:
+                    v = cache.get(name)
+                    if not (v and v.get("decision") == "compound" and v.get("canonical")):
+                        log(f"[fix:keep-unjudged] {name!r}")
+                        stats["keep_unjudged"] += 1
+                        continue
+                    facts = await pubchem_fetch(client, v["canonical"])
+                    if facts is None:  # resolution failure is never grounds to strip
+                        log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
+                        stats["keep_unresolved"] += 1
+                        continue
+                    else:
+                        new_block = format_block(facts)
+                        old_block = BLOCK_RE.search(desc).group(0)
+                        if new_block == old_block:
+                            log(f"[fix:same] {name!r}")
+                            stats["same"] += 1
+                            continue
+                        reason = None
+
+                stripped = BLOCK_RE.sub("", desc).rstrip()
+                if new_block is None:
+                    if not stripped:  # LightRAG rejects empty descriptions
+                        log(f"[fix:block-only] {name!r}")
+                        stats["block_only"] += 1
+                        continue
+                    new_desc = stripped
+                    kind = "strip"
+                    log(f"[fix:strip] {name!r} ({reason}){suffix}")
+                else:
+                    new_desc = stripped + "\n\n" + new_block
+                    kind = "rewrite"
+                    log(f"[fix:rewrite] {name!r} mp: {_block_mp(old_block)} -> "
+                        f"{_block_mp(new_block)}{suffix}")
+
+                if not args.dry_run:
+                    backup[name] = desc
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    backup_file.write_text(json.dumps(backup, ensure_ascii=False, indent=2),
+                                           encoding="utf-8")
+                    await write_entity(client, name, new_desc)
+                stats[kind] += 1
+            except FetchFailed:
+                log(f"[fix:fetch_failed] {name!r}")
+                stats["fetch_failed"] += 1
+            except Exception as e:
+                log(f"[fix:error] {name!r}: {e}")
+                stats["error"] += 1
+                error_names.append(name)
+
+    log("\n==== FIX-BLOCKS SUMMARY ====")
+    for k, v in stats.items():
+        log(f"  {k}: {v}")
+    if args.dry_run:
+        log("  (dry-run: no writes performed)")
+    if backup:
+        log(f"  backup: {backup_file}")
+    if error_names:
+        log("  nodes that hit [fix:error] (write may be partial; re-run --fix-blocks):")
+        for n in error_names:
+            log(f"    {n!r}")
+
+
 # ---------------------------------------------------------------- selftest
+async def _selftest_pubchem_fetch():
+    """pubchem_fetch never turns a bad reply into empty facts or a cache file (caller stubs sleeps)."""
+    global CACHE_DIR
+    import tempfile
+    timeout = {"Fault": {"Code": "PUGREST.Timeout"}}
+    ids = {"IdentifierList": {"CID": [962]}}
+
+    async def fetch(prop, syn):
+        def handler(request):
+            u = str(request.url)
+            if "/name/" in u:
+                return httpx.Response(200, json=ids)
+            if "/property/" in u:
+                return httpx.Response(200, json=prop)
+            if "/synonyms/" in u:
+                return httpx.Response(200, json=syn)
+            return httpx.Response(404, json={})  # pug_view: no melting point
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            try:
+                return await pubchem_fetch(c, "water")
+            except FetchFailed:
+                return "FetchFailed"
+
+    old_dir = CACHE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        CACHE_DIR = Path(tmp)
+        try:
+            props = {"PropertyTable": {"Properties": [{"CID": 962, "MolecularFormula": "H2O",
+                                                        "ConnectivitySMILES": "O"}]}}
+            assert await fetch(props, timeout) == "FetchFailed"
+            assert not list(CACHE_DIR.glob("*.json"))  # nothing cached on a bad synonyms reply
+            syns = {"InformationList": {"Information": [{"CID": 962, "Synonym": ["water"]}]}}
+            facts = await fetch(props, syns)
+            assert facts and facts["smiles"] == "O", facts  # ConnectivitySMILES rename
+            assert json.loads((CACHE_DIR / "962.json").read_text(encoding="utf-8"))["v"] == FACTS_VERSION
+        finally:
+            CACHE_DIR = old_dir
+
+
+async def _selftest_fetch():
+    """_pubchem_get retry/None/FetchFailed behaviour against httpx.MockTransport, no network."""
+    global PUBCHEM_MIN_INTERVAL, _sleep
+    busy = {"Fault": {"Code": "PUGREST.ServerBusy", "Message": "Too many requests"}}
+    ok = {"IdentifierList": {"CID": [962]}}
+
+    async def run(*replies):
+        it = iter(replies)
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            status, body = next(it, replies[-1])
+            return httpx.Response(status, json=body)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            try:
+                return await _pubchem_get(c, "http://x/y"), len(calls)
+            except FetchFailed:
+                return "FetchFailed", len(calls)
+
+    old_int, old_sleep = PUBCHEM_MIN_INTERVAL, _sleep
+
+    async def no_sleep(s):
+        pass
+
+    PUBCHEM_MIN_INTERVAL, _sleep = 0, no_sleep
+    try:
+        assert await run((200, busy), (200, ok)) == (ok, 2)  # ServerBusy Fault on a 200
+        assert await run((502, {}), (200, ok)) == (ok, 2)
+        assert await run((200, busy)) == ("FetchFailed", PUBCHEM_ATTEMPTS)  # always busy
+        assert await run((404, {})) == (None, 1)  # genuine not-found, no retry
+        timeout = {"Fault": {"Code": "PUGREST.Timeout"}}
+        srverr = {"Fault": {"Code": "PUGREST.ServerError"}}
+        assert await run((200, timeout), (200, ok)) == (ok, 2)  # non-busy Fault on a 200 is retried
+        assert await run((200, srverr)) == ("FetchFailed", PUBCHEM_ATTEMPTS)
+        assert await run((200, {"Fault": {"Code": "PUGREST.NotFound"}})) == (None, 1)
+        await _selftest_pubchem_fetch()
+    finally:
+        PUBCHEM_MIN_INTERVAL, _sleep = old_int, old_sleep
+
+
 def _selftest():
     p = _parse_judge
     assert p("COMPOUND: gallium") == {"decision": "compound", "canonical": "gallium"}
@@ -574,7 +835,7 @@ def _selftest():
     assert d == "not available", d
     for n in ("C", "Portlandite", "C-S-H Gel", "Ettringite Formation"):
         assert _rule_skip(n), n
-    for n in ("Gallium", "Paraffin Wax", "CaCO3", "Water"):
+    for n in ("Cu", "Sb", "O₂", "Gallium", "Paraffin Wax", "CaCO3", "Water"):
         assert not _rule_skip(n), n
 
     g = (f'<graphml xmlns="{GRAPHML_NS[1:-1]}">'
@@ -583,6 +844,11 @@ def _selftest():
          '<key id="d9" for="edge" attr.name="entity_type"/></graphml>')
     assert _find_type_key(ET.fromstring(g)) == "d7"
     assert _find_type_key(ET.fromstring(f'<graphml xmlns="{GRAPHML_NS[1:-1]}"/>')) is None
+    assert _find_key(ET.fromstring(g), "description") == "d1"
+    assert _block_mp(format_block({"cid": 1, "formula": "X", "mw": 1, "iupac": "x",
+                                   "smiles": "C", "mp": "12.0 °C"})) == "12.0 °C"
+    assert _block_mp("no block") == "?"
+    asyncio.run(_selftest_fetch())
     print("selftest OK")
 
 
@@ -592,11 +858,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="enumerate+judge+fetch, no graph writes")
     ap.add_argument("--refresh", action="store_true", help="re-enrich nodes already marked")
     ap.add_argument("--limit", type=int, default=0, help="cap number of candidates (testing)")
+    ap.add_argument("--fix-blocks", action="store_true",
+                    help="clean existing blocks: strip rule-skipped, rewrite changed (no judge calls; --dry-run = log only)")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
-    asyncio.run(run(args))
+    asyncio.run(fix_blocks(args) if args.fix_blocks else run(args))
 
 
 if __name__ == "__main__":
