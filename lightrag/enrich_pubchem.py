@@ -42,6 +42,7 @@ SCRIPT_DIR = Path(__file__).parent
 GRAPHML = SCRIPT_DIR / "data" / "rag_storage" / "graph_chunk_entity_relation.graphml"
 CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
+FACTS_VERSION = 2  # bump when fact parsing changes; stale-version CID cache files are re-fetched
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 def _load_lightrag_key():
@@ -177,8 +178,23 @@ def save_judge_cache(cache):
     JUDGE_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+RULE_SKIP_RE = re.compile(
+    r"\b(portlandite|ettringite|tobermorite|monosulfate|alite|belite|C-S-H|"
+    r"calcium silicate hydrate)\b",
+    re.IGNORECASE,
+)
+
+
+def _rule_skip(name):
+    """Deterministic pre-judge skip: ambiguous <=2-char symbols, cement hydration phases."""
+    n = (name or "").strip()
+    return len(n) <= 2 or bool(RULE_SKIP_RE.search(n))
+
+
 async def judge_one(client, sem, name, cache, refresh=False):
     """Returns (name, verdict); verdict None = judge error (never cached)."""
+    if _rule_skip(name):  # first: overrides old cached verdicts, no z.ai call, no cache write
+        return name, {"decision": "skip", "canonical": None}
     if name in cache and not (refresh and cache[name].get("decision") == "skip"):
         return name, cache[name]
     async with sem:
@@ -315,6 +331,8 @@ def _parse_mp(pugview):
             return f"{m.group(1)} °C"
     for s in strings:
         low = s.lower()
+        if "decompos" in low:
+            continue
         m = re.search(r"(-?\d+(?:\.\d+)?)\s*°?\s*f\b", low)
         if m:
             c = (float(m.group(1)) - 32) * 5 / 9
@@ -342,9 +360,11 @@ async def pubchem_fetch(client, canonical):
     cache_file = CACHE_DIR / f"{cid}.json"
     if cache_file.exists():
         facts = json.loads(cache_file.read_text(encoding="utf-8"))
-        if _confidence_ok(canonical, facts):
-            return facts
-        return None
+        if facts.get("v") == FACTS_VERSION:
+            if _confidence_ok(canonical, facts):
+                return facts
+            return None
+        # stale version: fall through, re-fetch and overwrite
     prop = await _pubchem_get(
         client,
         f"{PUBCHEM}/rest/pug/compound/cid/{cid}/property/"
@@ -365,6 +385,7 @@ async def pubchem_fetch(client, canonical):
     except (KeyError, IndexError, TypeError):
         synonyms = []
     facts = {
+        "v": FACTS_VERSION,
         "cid": cid,
         "formula": p.get("MolecularFormula", ""),
         "mw": p.get("MolecularWeight", ""),
@@ -549,6 +570,12 @@ def _selftest():
     k = _parse_mp(pv({"StringWithMarkup": [{"String": "300 K"}]}))
     assert k == "26.9 °C (converted from K)", k
     assert _parse_mp(None) == "not available"
+    d = _parse_mp(pv({"StringWithMarkup": [{"String": "1076 °F (Decomposes) (Loses H2O)"}]}))
+    assert d == "not available", d
+    for n in ("C", "Portlandite", "C-S-H Gel", "Ettringite Formation"):
+        assert _rule_skip(n), n
+    for n in ("Gallium", "Paraffin Wax", "CaCO3", "Water"):
+        assert not _rule_skip(n), n
 
     g = (f'<graphml xmlns="{GRAPHML_NS[1:-1]}">'
          '<key id="d1" for="node" attr.name="description"/>'

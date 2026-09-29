@@ -209,3 +209,10 @@ VERDICT: APPROVED
 - [LOW] Per-edit graphml rewrite + embed flush makes the write phase slower on the bigger graph; expected.
 
 ## Resolution: APPROVED at Round 5 (2 rounds this re-review, MAX_ROUNDS=5). One [HIGH] raised and retracted by GLM after Claude rebuttal; 3 MED + 4 LOW accepted into the plan. Code changes to enrich_pubchem.py await human sign-off.
+
+## Post-review changes 2026-09-29 (Claude, from --dry-run --limit 50)
+
+- Evidence: PubChem pug_view Melting Point for CID 6093208 (Portlandite) holds only strings like "1076 °F (Decomposes) (Loses H2O)"; `_parse_mp` skipped "decompos" in its °C loop but not in the °F/K fallback, so a decomposition temperature was written as a melting point. Fix: the "decompos" skip now applies to the °F/K fallback loop too.
+- Evidence: the cached judge verdict mapped the entity name "C" to graphite (ambiguous: carbon, sample label, Celsius), and the plan says cement phases (Portlandite, Ettringite, C-S-H gel) must be dropped but nothing enforced it. Fix: deterministic `_rule_skip` runs first in `judge_one` (before the cache, so it overrides old verdicts): names of 2 characters or fewer, and a cement-hydration-phase regex; no z.ai call, no cache write, counted as a normal skip.
+- Evidence: CID cache files in data/enrich_cache/{cid}.json were written by the old code and keep only the parsed mp string, so they hold stale values. Fix: `FACTS_VERSION = 2` stamped into facts; cache files with a different version are ignored, re-fetched and overwritten. Selftest extended for all three fixes.
+- These changes were made by Claude without a GLM round (small, evidence-driven fixes). Nodes enriched before 2026-09-29 still need a `--refresh` write run.
