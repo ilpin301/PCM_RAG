@@ -101,6 +101,17 @@ main agent has put everything you need in the task prompt.
      ```
      - If `$oa_code` is `429`: get the Retry-After header, compute reset hours, STOP immediately. Report: "OpenAlex budget exhausted. Resets in ~X hours (midnight UTC). Do not run — resume after reset."
      - If `$oa_code` is `200`: budget available, proceed.
+   - **Google Drive warm-up (MODE=full only; standing user rule 2026-09-29, do it without asking).** Start it NOW so it is warm by the time the run ends. If `GoogleDriveFS` is not running, start `GoogleDriveFS.exe` from the newest version folder under `C:\Program Files\Google\Drive File Stream` that contains it (NOT `Drivers`, which sorts last by name), then wait up to 3 min for `J:\My Drive` to appear:
+     ```powershell
+     if (-not (Get-Process GoogleDriveFS -ErrorAction SilentlyContinue)) {
+       $exe = Get-ChildItem 'C:\Program Files\Google\Drive File Stream' -Directory | Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'GoogleDriveFS.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+       Start-Process $exe
+     }
+     $deadline = (Get-Date).AddMinutes(3)
+     while (-not (Test-Path 'J:\My Drive') -and (Get-Date) -lt $deadline) { Start-Sleep 5 }
+     ```
+     If `J:\My Drive` still is missing, do not abort the run; note it and report the push as failed at the end.
    - Ingest-in-flight and pipeline-idle are verified above; do not start or stop any ingest.
 
 2. **Build the command.** Base:
@@ -170,6 +181,13 @@ OpenAlex meters a free daily budget (~$0.10 / 1000 credits, ~$0.001 per /works s
 
 4. **Do NOT blind-retry on failure.** The script self-retries only TRANSIENT OpenAlex 429/503 and z.ai 1305 internally (bounded ~4 attempts), and all LLM/search results are cached to disk, so a re-run after a crash is cheap — but the decision to re-run belongs to the main agent, not you. A **BUDGET 429** ("Insufficient budget / Resets at midnight UTC") is NOT transient: retrying or restarting is futile until the UTC reset or funds are added — see the "OpenAlex daily budget" section above. If it exits non-zero or throws, report the actual error text.
 
+5. **Drive backup after writes (MODE=full only; standing user rule 2026-09-29: "do this all the time after PubChem changes the RAG base" - do it without asking).** MODE=dry writes nothing: no push. Mirrors the CLAUDE.md ingest rules.
+   - Only after the run finished with writes and `docker logs --since 10m pcm_rag-lightrag-1` shows no pending `Error embedding` (queued vectors must have flushed - the push snapshots Qdrant; if some are pending, run the 500-recovery below first). Never push while an ingest is in flight.
+   - If `GoogleDriveFS` has been up < 5 min, wait until it has been up 5 min: `(Get-Process GoogleDriveFS | Sort-Object StartTime | Select-Object -First 1).StartTime`. A cold Drive makes the tgz overwrite block for minutes.
+   - Run from NATIVE PowerShell, not Git Bash (msys `tar` fails on `C:\` paths): `& X:\RAG_MAIN\PCM_RAG\rag_sync.ps1 push`. It exports Qdrant snapshots and tars rag_storage to `J:\My Drive\RAG\PCM_RAG\rag_storage.tgz`.
+   - A failed push is a FAILURE of the run: quote the error. Never claim the base is backed up without the push's success output AND a fresh tgz: `Get-Item 'J:\My Drive\RAG\PCM_RAG\rag_storage.tgz' | Select-Object Length, LastWriteTime`.
+   - If the full run outlives your wall-clock (see step 2), say the push is still owed and the main agent must do it after the run ends. A run stopped by the budget-429 that wrote some nodes still counts as having writes.
+
 ## If writes fail with HTTP 500
 Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors (`ConnectionError: Failed to connect to Ollama`). Do NOT restart the container. Start/verify Ollama (the Ollama and container-reach steps in Preconditions), then re-run (edits are idempotent). LightRAG writes the new description to the graph first and keeps failed vector upserts queued in its memory; the next successful edit flushes them. Confirm via a log line `flush: embedding N vectors` followed by `entity/edit ... 200` in `docker logs --since 10m pcm_rag-lightrag-1`. The first flush right after Ollama starts can itself still fail; a minute later it succeeds.
 
@@ -178,10 +196,11 @@ Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors 
 - The SUMMARY counts (enriched / skipped_judge / unresolved / hard_rule_reject / gone / already / error / timeout) and candidates/extractable totals.
 - If MODE=dry: list up to 10 of the `[dry-run] would enrich ...` lines (node name -> OpenAlex W-id + title), state clearly that NO writes were made and that a `full` run is the next step (on the user's approval).
 - If MODE=full: state whether the run FINISHED or is still running in the background (and whether the main agent needs to carry it to completion); note that enriched nodes now carry a `<!--OPENALEX_START-->` block and suggest the verify step: GET /graphs?label=<node name> to spot-check a couple of nodes.
+- If MODE=full: Drive backup pushed (tgz size + LastWriteTime) or the push error quoted exactly, or "push still owed" if the run is still going. MODE=dry: "no push (no writes)".
 - Any precondition failure, budget-429 STOP, or error, quoted exactly.
 
 ## Hard rules
-- You may START Docker Desktop, the compose services and Ollama as in the preflight. Never STOP or restart the lightrag container (queued vector updates live in its memory until a successful flush). Never start or stop an ingest.
+- You may START Docker Desktop, the compose services, Ollama and Google Drive as in the preflight. Never STOP or restart the lightrag container (queued vector updates live in its memory until a successful flush). Never start or stop an ingest.
 - Never invent API keys, and never write a key literal into any file. Keys are READ from `.env` only.
 - On a fresh enrichment, prefer MODE=dry first if the main agent gave you a choice; but always obey the MODE you were given.
 - Run only ONE instance of the script at a time.

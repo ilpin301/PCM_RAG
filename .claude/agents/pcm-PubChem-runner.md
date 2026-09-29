@@ -89,6 +89,18 @@ main agent has put everything you need in the task prompt.
       Do this for every MODE that writes (full, fix); for dry/fix-dry it is harmless but optional.
    g. ZAI key (modes dry/full only): `if [ -z "$ZAI_API_KEY" ]; then echo MISSING; fi`. If MISSING, STOP and report that `ZAI_API_KEY` must be set before running. You cannot set it. Fix modes need no ZAI key.
 
+   h. Google Drive warm-up (MODE=full and fix only; standing user rule 2026-09-29, do it without asking). Start it NOW so it is warm by the time the run ends. If `GoogleDriveFS` is not running, start `GoogleDriveFS.exe` from the newest version folder under `C:\Program Files\Google\Drive File Stream` that contains it (NOT `Drivers`, which sorts last by name), then wait up to 3 min for `J:\My Drive` to appear:
+      ```powershell
+      if (-not (Get-Process GoogleDriveFS -ErrorAction SilentlyContinue)) {
+        $exe = Get-ChildItem 'C:\Program Files\Google\Drive File Stream' -Directory | Sort-Object Name -Descending |
+               ForEach-Object { Join-Path $_.FullName 'GoogleDriveFS.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        Start-Process $exe
+      }
+      $deadline = (Get-Date).AddMinutes(3)
+      while (-not (Test-Path 'J:\My Drive') -and (Get-Date) -lt $deadline) { Start-Sleep 5 }
+      ```
+      If `J:\My Drive` still is missing, do not abort the run; note it and report the push as failed at the end.
+
    Only STOP and report if something still is not up after the waits above.
 
 2. **Offline check.** Before any run: `cd X:\RAG_MAIN\PCM_RAG\lightrag && python enrich_pubchem.py --selftest` must print `selftest OK` (no network, no graph). If it fails, STOP and report the assertion.
@@ -103,6 +115,13 @@ main agent has put everything you need in the task prompt.
 
 5. **Do NOT blind-retry on failure.** The script already self-retries transient z.ai 1305 / PubChem 429/503 internally. If it exits non-zero or throws, report the actual error text — do not re-run it in a loop.
 
+6. **Drive backup after writes (MODE=full and fix only; standing user rule 2026-09-29: "do this all the time after PubChem changes the RAG base" - do it without asking).** MODE=dry and fix-dry write nothing: no push. Mirrors the CLAUDE.md ingest rules.
+   - Only after the run finished with writes and `docker logs --since 10m pcm_rag-lightrag-1` shows no pending `Error embedding` (queued vectors must have flushed - the push snapshots Qdrant; if some are pending, run the 500-recovery below first). Never push while an ingest is in flight.
+   - If `GoogleDriveFS` has been up < 5 min, wait until it has been up 5 min: `(Get-Process GoogleDriveFS | Sort-Object StartTime | Select-Object -First 1).StartTime`. A cold Drive makes the tgz overwrite block for minutes.
+   - Run from NATIVE PowerShell, not Git Bash (msys `tar` fails on `C:\` paths): `& X:\RAG_MAIN\PCM_RAG\rag_sync.ps1 push`. It exports Qdrant snapshots and tars rag_storage to `J:\My Drive\RAG\PCM_RAG\rag_storage.tgz`.
+   - A failed push is a FAILURE of the run: quote the error. Never claim the base is backed up without the push's success output AND a fresh tgz: `Get-Item 'J:\My Drive\RAG\PCM_RAG\rag_storage.tgz' | Select-Object Length, LastWriteTime`.
+   - If the full run outlives your wall-clock (see step 3), say the push is still owed and the main agent must do it after the run ends.
+
 ## If writes fail with HTTP 500
 Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors (`ConnectionError: Failed to connect to Ollama`). Do NOT restart the container. Start/verify Ollama (steps d and f), then re-run (edits are idempotent). LightRAG writes the new description to the graph first and keeps failed vector upserts queued in its memory; the next successful edit flushes them. Confirm via a log line `flush: embedding N vectors` followed by `entity/edit ... 200` in `docker logs --since 10m pcm_rag-lightrag-1`. The first flush right after Ollama starts can itself still fail; a minute later it succeeds.
 
@@ -112,11 +131,12 @@ Check `docker logs --since 10m pcm_rag-lightrag-1` for Ollama connection errors 
 - If MODE=dry or fix-dry: state clearly that NO writes were made and that the write run (`full` / `fix`) is the next step (on the user's approval).
 - If MODE=full: state that enriched nodes now carry a `<!--PUBCHEM_START-->` block and suggest the verify step: query the rag "what is the melting point of paraffin wax?" or GET /graphs?label=<name> to spot-check.
 - If MODE=fix: report the backup file path the script prints.
-- Anything you started in the preflight (Docker Desktop, compose, Ollama).
+- If MODE=full or fix: Drive backup pushed (tgz size + LastWriteTime) or the push error quoted exactly, or "push still owed" if the run is still going. Dry modes: "no push (no writes)".
+- Anything you started in the preflight (Docker Desktop, compose, Ollama, Google Drive).
 - Any precondition failure or error, quoted exactly.
 
 ## Hard rules
-- You may START Docker Desktop, the compose services and Ollama as in the preflight. Never STOP or restart the lightrag container (queued vector updates live in its memory until a successful flush). Never start or stop an ingest.
+- You may START Docker Desktop, the compose services, Ollama and Google Drive as in the preflight. Never STOP or restart the lightrag container (queued vector updates live in its memory until a successful flush). Never start or stop an ingest.
 - Never set ZAI_API_KEY or invent an API key.
 - On a fresh enrichment, prefer MODE=dry first if the main agent gave you a choice; but always obey the MODE you were given.
 - The script is idempotent and resumable — a re-run is safe; never worry that re-running will double-write (the marker prevents it).
