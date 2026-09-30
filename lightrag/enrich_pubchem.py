@@ -34,7 +34,7 @@ EXIT CODES:
   0  ok
   1  fatal precondition (missing key / graphml; --collect with --dry-run; --collect FILE exists without --force)
   2  judge_error abort (>10% of names failed to judge)
-  3  Ollama unreachable (write runs)
+  3  Ollama unreachable (write runs) or LightRAG unreachable (any run)
   4  stopped on GLM quota or --max-glm-tokens budget (resume later): judge.json is saved and
      data/enrich_cache/RESUME.json says when to re-run; stops BEFORE any PubChem fetch or graph write.
      Re-run the same command after reset_at; judged names, PubChem cache and graph markers skip finished work.
@@ -146,6 +146,18 @@ def require_ollama():
     except Exception:
         log(f"FATAL: Ollama not reachable at {OLLAMA_URL} - the server needs it to embed "
             "edited descriptions; start Ollama first")
+        sys.exit(3)
+
+
+def require_lightrag(url=LIGHTRAG_URL):
+    """Fail fast before the node loop: every node reads its current description from the server,
+    so with LightRAG down each one would just log 'All connection attempts failed'."""
+    try:
+        httpx.get(f"{url}/health", headers={"X-API-Key": LIGHTRAG_KEY}, timeout=10,
+                  trust_env=False).raise_for_status()
+    except Exception:
+        log(f"FATAL: LightRAG not reachable at {url} - start Docker Desktop and "
+            "`docker compose up -d` in lightrag/ first (pcm-PubChem-runner Step 0)")
         sys.exit(3)
 
 
@@ -777,6 +789,7 @@ async def run(args):
     if not ZAI_KEY:
         log("FATAL: ZAI_API_KEY not set.")
         sys.exit(1)
+    require_lightrag()
     if not args.dry_run and not args.collect:
         require_ollama()
 
@@ -959,6 +972,7 @@ async def fix_blocks(args):
             log("FATAL: --verify needs ZAI_API_KEY.")
             sys.exit(1)
     verify_cache = load_verify_cache() if args.verify else {}
+    require_lightrag()
     if not args.dry_run and not args.collect:
         require_ollama()
 
@@ -1366,6 +1380,12 @@ def _selftest():
             assert scan_leaks() == ["node Ice"], scan_leaks()
         finally:
             GRAPHML = old_g
+    try:  # require_lightrag: fail fast when the server is down (a run once logged 551 connection errors)
+        require_lightrag("http://127.0.0.1:9")
+    except SystemExit as ex:
+        assert ex.code == 3, ex.code
+    else:
+        raise AssertionError("require_lightrag did not exit")
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     asyncio.run(_selftest_verify())
