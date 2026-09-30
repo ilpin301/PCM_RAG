@@ -22,13 +22,14 @@ description: >-
   cleanly on the z.ai plan quota or after n GLM tokens; exit 4 + RESUME.json;
   dry/collect/full) and EXCLUDE="<name1>|<name2>" (apply/full/fix: entity names
   dropped from the pending file before apply, used when collect resolved a node
-  wrongly). PRECONDITION the main agent must ensure before delegating: no ingest
+  wrongly) and VERIFY=yes (fix/fix-dry only: adds --verify, one cached GLM yes/no
+  per resolved block, rejected blocks are stripped; needs ZAI_API_KEY). PRECONDITION the main agent must ensure before delegating: no ingest
   is running and the pipeline is IDLE (phase B stops the lightrag service, which
   would kill a running upload). The main agent does NOT need to pre-start
   anything: this runner itself starts Docker Desktop, the compose services
   (LightRAG + Qdrant), Ollama and Google Drive when they are down, exactly like
   the il-rag-ingest Step 0 preflight. ZAI_API_KEY must be set in the environment
-  for dry/collect/full (not needed for apply/fix/fix-dry). The run is
+  for dry/collect/full and for fix/fix-dry with VERIFY=yes (not needed for apply or plain fix/fix-dry). The run is
   resumable/idempotent: re-runs reuse cached judge + PubChem JSON, and a
   re-collect skips nodes that already carry the marker, so a re-run after an
   interruption is cheap and safe.
@@ -54,6 +55,7 @@ Enrichment is two phases. **Phase A (collect)**: the script judges, fetches PubC
 - `REFRESH` — optional; if `yes`, pass `--refresh` (re-enrich already-marked nodes). dry/collect/full.
 - `GLM_TOKEN_BUDGET` — optional integer (dry/collect/full only); if present, pass `--max-glm-tokens <N>`. The script then stops cleanly (exit 4) once GLM has used N tokens.
 - `EXCLUDE` — optional `"<name1>|<name2>"` (apply/full/fix only): entity names dropped from the pending file before apply.
+- `VERIFY` — optional (fix/fix-dry only); if `yes`, pass `--verify`: one cached GLM yes/no per resolved block, rejected blocks are stripped. Needs `ZAI_API_KEY`.
 
 `FILE` (the pending file), all under `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\`:
 - `pending_pubchem.json` — collect, apply, full.
@@ -100,7 +102,7 @@ Enrichment is two phases. **Phase A (collect)**: the script judges, fetches PubC
       ```
       The container-reaches-Ollama check (`host.docker.internal`) is NOT needed any more: the container does no writes.
    e. Pipeline must be IDLE: `curl.exe -s http://127.0.0.1:9622/documents/pipeline_status -H "X-API-Key: $key"` must show `busy` false, else STOP and report "pipeline busy" (phase B stops the lightrag service and would kill a running upload).
-   f. ZAI key (modes dry/collect/full only): `if [ -z "$ZAI_API_KEY" ]; then echo MISSING; fi`. If MISSING, STOP and report that `ZAI_API_KEY` must be set before running. You cannot set it. Apply, fix and fix-dry need no ZAI key.
+   f. ZAI key (modes dry/collect/full, and fix/fix-dry with VERIFY=yes): `if [ -z "$ZAI_API_KEY" ]; then echo MISSING; fi`. If MISSING, STOP and report that `ZAI_API_KEY` must be set before running. You cannot set it. Apply, fix and fix-dry need no ZAI key.
    g. Google Drive warm-up (MODE=apply, full and fix only; standing user rule 2026-09-29, do it without asking). Start it NOW so it is warm by the time the pre-apply push is due. If `GoogleDriveFS` is not running, start `GoogleDriveFS.exe` from the newest version folder under `C:\Program Files\Google\Drive File Stream` that contains it (NOT `Drivers`, which sorts last by name), then wait up to 3 min for `J:\My Drive` to appear:
       ```powershell
       if (-not (Get-Process GoogleDriveFS -ErrorAction SilentlyContinue)) {
@@ -119,7 +121,7 @@ Enrichment is two phases. **Phase A (collect)**: the script judges, fetches PubC
 
 3. **Phase A: build the command and collect** (modes dry, collect, full, fix-dry, fix; skip for `apply`). Base:
    `NO_PROXY='*' python enrich_pubchem.py`
-   Append flags per inputs: `--dry-run` if MODE=dry; `--fix-blocks --dry-run` if MODE=fix-dry; `--collect <FILE> --force` if MODE=collect or full (FILE = `pending_pubchem.json`); `--fix-blocks --collect <FILE> --force` if MODE=fix (FILE = `pending_pubchem_fix.json`); `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes; `--max-glm-tokens <GLM_TOKEN_BUDGET>` if given.
+   Append flags per inputs: `--dry-run` if MODE=dry; `--fix-blocks --dry-run` if MODE=fix-dry; `--collect <FILE> --force` if MODE=collect or full (FILE = `pending_pubchem.json`); `--fix-blocks --collect <FILE> --force` if MODE=fix (FILE = `pending_pubchem_fix.json`); `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes; `--max-glm-tokens <GLM_TOKEN_BUDGET>` if given; `--verify` if VERIFY=yes (fix/fix-dry only).
    Always `--force` with `--collect`: a pending file is always rebuildable from the caches, and nodes already applied carry their marker so a re-collect skips them. `--collect` never combines with `--dry-run` (the script exits 1).
    Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; pass timeout 600000 to the Bash tool for short runs). A `collect`/`full` run judges ~2000+ uncached names and runs for hours. Launch every run longer than ~10 min with the DETACHED LAUNCH recipe below, never with the Bash/PowerShell tool's `run_in_background`: a harness background task is hard-killed at its timeout (max 2 h) and takes the python process with it (2026-09-30: a full run died silently at exactly 2 h 00 min, mid-write, no traceback, no RESUME.json).
 
@@ -135,8 +137,8 @@ Enrichment is two phases. **Phase A (collect)**: the script judges, fetches PubC
    **Waiting:** foreground PowerShell calls only, each under 10 min (timeout 600000), each a silent loop `while (Get-Process -Id $runPid -ErrorAction SilentlyContinue) { Start-Sleep 30 }` (`$runPid` = the PID from RUN_STATE.json; never `$pid`, which is PowerShell's own process id) with a deadline of ~9 min; repeat the call until the PID is gone. No output per iteration. Exit code: the script's SUMMARY block / `.err` contents (Start-Process -PassThru ExitCode is lost once the tool shell exits). A PID gone with no SUMMARY and an empty `.err` = killed from outside: report it, do not assume success. Delete the log/.err only if the SUMMARY is present and there were no errors. Run ONLY ONE instance at a time.
    The script has its own fail-fast guard: exit 3 with `FATAL: Ollama not reachable ...` on a write run when Ollama is down (collect makes no writes, so it does not trigger there). Treat that as a preflight failure, not a script bug.
 
-4. **Capture + interpret phase A.** The script prints per-node lines (`[collected] <name> -> ...` in collect modes, `[enriched]`, `[skipped_judge]`, `[unresolved]`, `[gone]`, `[already]`, `[error]`; fix modes print `[fix:strip]`, `[fix:rewrite]`, `[fix:same]`, `[fix:keep-*]`, `[fix:error]`) and ends with an `==== SUMMARY ====` (or `==== FIX-BLOCKS SUMMARY ====`) block of counts plus `candidates:` / `compounds:`. Read those counts. In collect modes also read `collected: N -> FILE` and record N.
-   - **Exit 4 (GLM quota/budget)** happens BEFORE the collect loop: no new FILE, no apply, even in MODE=full (a FILE already on disk is from an earlier collect, never apply it here). Handle as in "Usage limits".
+4. **Capture + interpret phase A.** The script prints per-node lines (`[collected] <name> -> ...` in collect modes, `[enriched]`, `[skipped_judge]`, `[unresolved]`, `[rejected]`, `[unverified]`, `[gone]`, `[already]`, `[error]`; fix modes print `[fix:strip]` (reason `verify-reject: ...` for verify rejects), `[fix:rewrite]`, `[fix:same]`, `[fix:keep-*]` incl. `[fix:keep-unverified]`, `[fix:error]`) and ends with an `==== SUMMARY ====` (or `==== FIX-BLOCKS SUMMARY ====`) block of counts plus `candidates:` / `compounds:`. Read those counts. In collect modes also read `collected: N -> FILE` and record N.
+   - **Exit 4 (GLM quota/budget)** happens BEFORE the collect loop (judge phase) or, since the verify step, mid-loop (collect/full, and fix with VERIFY=yes). A FILE written on exit 4 is partial: never apply it, even in MODE=full / fix. Handle as in "Usage limits"; the re-run after reset_at re-collects with --force from the caches.
    - MODE=collect / MODE=dry / MODE=fix-dry: stop here and report (step 8). MODE=full / fix: continue with phase B (step 6) when the SUMMARY is present and exit was clean.
 
 5. **Do NOT blind-retry on failure.** The script already self-retries transient z.ai 1305 / PubChem 429/503 internally. If it exits non-zero or throws, report the actual error text — do not re-run it in a loop.
@@ -184,8 +186,8 @@ Enrichment is two phases. **Phase A (collect)**: the script judges, fetches PubC
 ## Usage limits (GLM quota / Claude session)
 **GLM (z.ai 5-hour rolling limit, weekly/monthly limit, balance).**
 - Pass `--max-glm-tokens <N>` when the main agent gives `GLM_TOKEN_BUDGET`.
-- Exit code 4 = clean stop on GLM quota or budget (`--fix-blocks` never judges, so never exits 4). Read `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RESUME.json` and report: `reason` (`glm_quota` | `glm_budget`), `reset_at`, `glm_tokens_used`, `judged_this_run`, `not_judged_remaining` and `resume_command`. Do NOT retry before `reset_at` (the script refuses to start until then anyway; `--ignore-resume` bypasses that - never use it on your own).
-- Exit 4 always happens BEFORE any PubChem fetch, collect loop or graph write, so no FILE, no apply and no Drive push is owed for that run. `judge.json` is saved (also every 25 verdicts, so a kill loses little).
+- Exit code 4 = clean stop on GLM quota or budget (`--fix-blocks` exits 4 only with --verify). Read `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RESUME.json` and report: `reason` (`glm_quota` | `glm_budget`), `reset_at`, `glm_tokens_used`, `judged_this_run`, `not_judged_remaining` and `resume_command`. Do NOT retry before `reset_at` (the script refuses to start until then anyway; `--ignore-resume` bypasses that - never use it on your own).
+- Exit 4 never leads to an apply or a Drive push: no graph write happens in collect modes, and a partial FILE is never applied. `judge.json` (saved every 25 verdicts) and `verify.json` (saved per verdict) survive, so a kill loses little.
 - z.ai 1305 is a concurrency limit, not quota: the script backs off and retries by itself.
 
 **Claude session (5-hour limit).**
@@ -203,7 +205,7 @@ See step 6.6: act per exit code (2 / 3 / 5 / 6 / other). Do NOT restart the cont
 - MODE run and exact command(s) used (phase A command, phase B launch line).
 - Phase A: the SUMMARY counts (enriched / skipped_judge / unresolved / gone / already / error, or the fix-blocks counts), candidates/compounds totals, and `collected: N -> FILE`.
 - If MODE=dry or fix-dry: state clearly that NO writes were made and that `collect` / `full` (or `fix`) is the next step (on the user's approval).
-- If MODE=collect: state clearly that NO graph writes were made. Give the collected count N + FILE, up to 15 `[collected]` lines, and FLAG suspicious resolutions (e.g. a melting point that looks wrong for the name, or several different names resolving to one CID) so the main agent can pass `EXCLUDE="<name1>|<name2>"`. The next step is `MODE=apply` on the user's OK.
+- If MODE=collect: state clearly that NO graph writes were made. Give the collected count N + FILE, up to 15 `[collected]` lines, and FLAG suspicious resolutions (e.g. a melting point that looks wrong for the name, or several different names resolving to one CID) so the main agent can pass `EXCLUDE="<name1>|<name2>"`; list every `[rejected]` / `verify-reject` line (these are the verify check's rejects for the user to review). The next step is `MODE=apply` on the user's OK.
 - If MODE=apply, full or fix: the `APPLY SUMMARY ...` line, `SELF-VERIFY` line, `VECTOR SANITY CHECK` line, `EXITCODE=`, the names of any `[changed]` / `[gone]` entries, the rollback file path, the archived pending-file name (`<stem>.applied.<stamp>.json`) and the excluded names (dropped / not found). Suggest the verify step: query the rag "what is the melting point of paraffin wax?" or GET /graphs?label=<name> to spot-check; enriched nodes carry a `<!--PUBCHEM_START-->` block.
 - If MODE=apply, full or fix: both Drive pushes (pre-apply and post-apply), each with tgz size + LastWriteTime or the push error quoted exactly, or "push still owed". dry, fix-dry, collect: "no push (no writes)".
 - Anything you started in the preflight (Docker Desktop, compose, Ollama, Google Drive).

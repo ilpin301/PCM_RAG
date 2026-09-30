@@ -23,6 +23,7 @@ USAGE:
   python enrich_pubchem.py --collect FILE [--force]  # NO graph writes: collect {name: {old, new}} into FILE,
                                       # then apply with ingest.ps1 -Root <base> -DescFile FILE
   python enrich_pubchem.py --fix-blocks --collect FILE  # same for block cleanup (no graph writes, no backup file)
+  python enrich_pubchem.py --fix-blocks --verify [--collect FILE]  # also GLM-verify each resolved block, strip rejects
   python enrich_pubchem.py --max-glm-tokens 500000  # stop cleanly once GLM has used N tokens (0 = no cap)
   python enrich_pubchem.py --ignore-resume  # start although RESUME.json says a quota stop is still active
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
@@ -35,6 +36,8 @@ EXIT CODES:
   4  stopped on GLM quota or --max-glm-tokens budget (resume later): judge.json is saved and
      data/enrich_cache/RESUME.json says when to re-run; stops BEFORE any PubChem fetch or graph write.
      Re-run the same command after reset_at; judged names, PubChem cache and graph markers skip finished work.
+     With the verify step (normal runs, --fix-blocks --verify) it can also stop mid-loop; a --collect FILE
+     then holds verified entries only - re-collect after reset_at instead of applying it.
 """
 import argparse
 import asyncio
@@ -61,6 +64,7 @@ GRAPHML = SCRIPT_DIR / "data" / "rag_storage" / "graph_chunk_entity_relation.gra
 CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
+VERIFY_FILE = "verify.json"  # under CACHE_DIR; GLM same-substance verdicts per (name, CID)
 FACTS_VERSION = 3  # bump when fact parsing changes; stale-version CID cache files are re-fetched
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
@@ -242,12 +246,19 @@ RULE_SKIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# carbon allotropes/forms: PubChem only has atomic C (CID 5462310, IUPAC "methane", mp 3500 °C) - wrong for all
+CARBON_SKIP_RE = re.compile(
+    r"^carbon$|\b(graphene|diamond|carbon black|acetylene black|HOPG|carbon nano[ -]?(wires?|tubes?)|"
+    r"[MS]?W?CNTs?)\b|graphite\b",
+    re.IGNORECASE,
+)
+
 
 def _rule_skip(name):
-    """Deterministic pre-judge skip: single-char names (ambiguous), cement hydration phases.
+    """Deterministic pre-judge skip: single-char names (ambiguous), cement hydration phases, carbon allotropes/forms.
     Two-char names stay allowed: they include real elements (Cu, Ge, Sb, Te, Si, Se, Sn, Bi)."""
     n = (name or "").strip()
-    return len(n) == 1 or bool(RULE_SKIP_RE.search(n))
+    return len(n) == 1 or bool(RULE_SKIP_RE.search(n) or CARBON_SKIP_RE.search(n))
 
 
 QUOTA_CODES = {"1308", "1309", "1310", "1113"}  # 5h/weekly/monthly usage limit, insufficient balance
@@ -285,6 +296,47 @@ def _request_stop(reason, reset_at=None):
         log(f"[judge] STOP requested ({reason}, reset_at={reset_at}); no further z.ai calls")
 
 
+async def _zai_chat(client, system, user, who):
+    """One z.ai chat call with 1305 backoff. Reply text, or None (error / quota / stop flag set).
+    Quota sets the stop flag; the token budget is checked after a reply, which is still returned."""
+    for attempt in range(4):
+        if _glm["stop"]:
+            return None
+        try:
+            r = await client.post(
+                f"{ZAI_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {ZAI_KEY}"},
+                json={
+                    "model": JUDGE_MODEL,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+                timeout=60,
+            )
+            is_quota, reset_at = _zai_quota_error(r)
+            if is_quota:  # usage limit / balance: retrying is pointless, stop cleanly
+                _request_stop("glm_quota", reset_at)
+                return None
+            if r.status_code == 429 or "1305" in r.text:
+                await asyncio.sleep(2 * (attempt + 1))  # z.ai concurrency (1305): back off
+                continue
+            r.raise_for_status()
+            body = r.json()
+            _glm["tokens"] += int((body.get("usage") or {}).get("total_tokens") or 0)
+            if _glm["max"] and _glm["tokens"] >= _glm["max"]:
+                _request_stop("glm_budget")  # this reply is still used; later calls are not made
+            return body["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if attempt == 3:
+                log(f"[glm] ERROR {who}: {e}")
+                return None
+            await asyncio.sleep(2 * (attempt + 1))
+    return None
+
+
 async def judge_one(client, sem, name, cache, refresh=False):
     """Returns (name, verdict); verdict None = judge error (never cached), or - when the stop flag
     is set - not judged (name goes into _not_judged; NOT a judge error)."""
@@ -302,52 +354,22 @@ async def judge_one(client, sem, name, cache, refresh=False):
     if stopped():
         return name, None
     async with sem:
-        for attempt in range(4):
-            if stopped():  # flag may have been set while this task waited for the semaphore / backed off
-                return name, None
-            try:
-                r = await client.post(
-                    f"{ZAI_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {ZAI_KEY}"},
-                    json={
-                        "model": JUDGE_MODEL,
-                        "temperature": 0,
-                        "messages": [
-                            {"role": "system", "content": JUDGE_SYSTEM},
-                            {"role": "user", "content": f"Entity name: {name}"},
-                        ],
-                    },
-                    timeout=60,
-                )
-                is_quota, reset_at = _zai_quota_error(r)
-                if is_quota:  # usage limit / balance: retrying is pointless, stop cleanly
-                    _request_stop("glm_quota", reset_at)
-                    _not_judged.add(name)
-                    return name, None
-                if r.status_code == 429 or "1305" in r.text:
-                    await asyncio.sleep(2 * (attempt + 1))  # z.ai concurrency (1305): back off
-                    continue
-                r.raise_for_status()
-                body = r.json()
-                _glm["tokens"] += int((body.get("usage") or {}).get("total_tokens") or 0)
-                if _glm["max"] and _glm["tokens"] >= _glm["max"]:
-                    _request_stop("glm_budget")  # this reply is still used; later calls are not made
-                out = body["choices"][0]["message"]["content"].strip()
-                verdict = _parse_judge(out)
-                if verdict is None:
-                    log(f"[judge] unparseable reply for {name!r}: {out[:80]!r}")
-                    return name, None
-                cache[name] = verdict
-                _glm["new"] += 1
-                if _glm["new"] % SAVE_EVERY == 0:
-                    save_judge_cache(cache)
-                return name, verdict
-            except Exception as e:
-                if attempt == 3:
-                    log(f"[judge] ERROR {name!r}: {e}")
-                    return name, None
-                await asyncio.sleep(2 * (attempt + 1))
-    return name, None
+        if stopped():  # flag may have been set while this task waited for the semaphore
+            return name, None
+        out = await _zai_chat(client, JUDGE_SYSTEM, f"Entity name: {name}", f"judge {name!r}")
+        if out is None:
+            if _glm["stop"]:
+                _not_judged.add(name)
+            return name, None
+        verdict = _parse_judge(out)
+        if verdict is None:
+            log(f"[judge] unparseable reply for {name!r}: {out[:80]!r}")
+            return name, None
+        cache[name] = verdict
+        _glm["new"] += 1
+        if _glm["new"] % SAVE_EVERY == 0:
+            save_judge_cache(cache)
+        return name, verdict
 
 
 JUDGE_RE = re.compile(r"COMPOUND:|\bSKIP\b", re.IGNORECASE)
@@ -366,6 +388,54 @@ def _parse_judge(text):
     if not canon:
         return None
     return {"decision": "compound", "canonical": canon}
+
+
+VERIFY_SYSTEM = (
+    "You check a PubChem match for an entity name from a phase-change-material knowledge graph. "
+    "Given the name and the PubChem record's IUPAC name and molecular formula, decide whether the "
+    "record is the SAME substance the name denotes.\n"
+    "- Form words (Nanoparticles, Powder, Nanofluid, Nanowire, Flakes) do not change the substance.\n"
+    "- A different compound, hydration state or composition is NOT the same "
+    "(e.g. 'Graphene Oxide' vs methane CH4 -> NO).\n"
+    "Reply with EXACTLY ONE word: YES or NO."
+)
+VERIFY_RE = re.compile(r"\b(YES|NO)\b", re.IGNORECASE)
+
+
+def _parse_verify(text):
+    """First standalone YES/NO in the reply -> True/False; None = unparseable."""
+    m = VERIFY_RE.search(text or "")
+    return None if not m else m.group(1).upper() == "YES"
+
+
+def load_verify_cache():
+    f = CACHE_DIR / VERIFY_FILE
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
+def save_verify_cache(cache):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / VERIFY_FILE).write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def verify_match(client, name, facts, cache):
+    """GLM yes/no: is PubChem record `facts` the substance `name` denotes? True/False, cached per
+    (name, CID) and saved at once; None = not verified (error, unparseable, stop flag), never cached."""
+    hit = cache.get(name)
+    if hit and hit.get("cid") == facts["cid"]:
+        return hit["same"]
+    out = await _zai_chat(
+        client, VERIFY_SYSTEM,
+        f"Entity name: {name}\nPubChem CID {facts['cid']}: IUPAC name {facts.get('iupac') or '(none)'}; "
+        f"formula {facts.get('formula') or '(none)'}",
+        f"verify {name!r}")
+    same = _parse_verify(out)
+    if out is not None and same is None:
+        log(f"[verify] unparseable reply for {name!r}: {out[:80]!r}")
+    if same is not None:
+        cache[name] = {"cid": facts["cid"], "same": same}
+        save_verify_cache(cache)
+    return same
 
 
 async def judge_all(names, cache, refresh=False):
@@ -419,7 +489,7 @@ def _write_resume_and_exit(names):
         "judged_this_run": _glm["new"],
         "not_judged_remaining": len(_not_judged),
         "resume_command": " ".join(["python", "enrich_pubchem.py"] + sys.argv[1:]),
-        "note": "judge.json is saved; re-run the same command after reset_at; "
+        "note": "judge.json and verify.json are saved; re-run the same command after reset_at; "
                 "PubChem cache and graph markers make the re-run skip finished work",
     }
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -428,8 +498,7 @@ def _write_resume_and_exit(names):
     log(f"  reason: {info['reason']}  reset_at: {info['reset_at']}")
     log(f"  glm tokens used: {info['glm_tokens_used']}  judged this run: {info['judged_this_run']}  "
         f"not judged: {info['not_judged_remaining']} of {len(names)} names")
-    log(f"  judge.json saved; no PubChem calls, no graph writes. Resume after reset_at: "
-        f"{info['resume_command']}")
+    log(f"  judge.json + verify.json saved. Resume after reset_at: {info['resume_command']}")
     log(f"  details: {CACHE_DIR / RESUME_FILE}")
     sys.exit(4)
 
@@ -673,7 +742,7 @@ async def run(args):
         require_ollama()
 
     stats = {"enriched": 0, "skipped_judge": 0, "judge_error": 0, "unresolved": 0,
-             "fetch_failed": 0, "gone": 0, "already": 0, "error": 0}
+             "rejected": 0, "unverified": 0, "fetch_failed": 0, "gone": 0, "already": 0, "error": 0}
     error_names = []
     collected = {}  # --collect: {name: {"old", "new"}} instead of graph writes
 
@@ -684,6 +753,7 @@ async def run(args):
         log(f"[limit] capped to {len(names)} candidates")
 
     judge_cache = load_judge_cache()
+    verify_cache = load_verify_cache()
     log(f"[judge] classifying {len(names)} names (Semaphore 2)...")
     verdicts = await judge_all(names, judge_cache, args.refresh)
     if _glm["stop"]:  # judge.json already saved by judge_all; stop BEFORE any PubChem fetch / graph write
@@ -722,6 +792,19 @@ async def run(args):
                     if not facts:
                         log(f"[unresolved] {name!r} (canonical={canonical!r})")
                         stats["unresolved"] += 1
+                        continue
+
+                    same = await verify_match(client, name, facts, verify_cache)
+                    if same is None:
+                        log(f"[unverified] {name!r} -> CID {facts['cid']}")
+                        stats["unverified"] += 1
+                        if _glm["stop"]:
+                            break  # GLM quota/budget: nothing further can be verified
+                        continue
+                    if not same:
+                        log(f"[rejected] {name!r} -> CID {facts['cid']} {facts.get('formula')} "
+                            f"({facts.get('iupac')})")
+                        stats["rejected"] += 1
                         continue
 
                     block = format_block(facts)
@@ -770,6 +853,8 @@ async def run(args):
             "re-run with --refresh:")
         for n in error_names:
             log(f"    {n!r}")
+    if _glm["stop"]:  # stopped mid-loop on the verify step; a --collect FILE holds verified entries only
+        _write_resume_and_exit(names)
 
 
 MP_TEXT_RE = re.compile(r"Melting point (.*?)\. Source:", re.DOTALL)
@@ -803,15 +888,21 @@ def _marked_names():
 
 
 async def fix_blocks(args):
-    """Clean existing PubChem blocks: strip ONLY rule-skipped nodes, rewrite changed blocks,
-    keep unjudged and unresolved. No judge calls, no ZAI key. Backs up descriptions before writes."""
+    """Clean existing PubChem blocks: strip rule-skipped nodes, rewrite changed blocks, keep unjudged and unresolved. No judge calls. --verify adds one cached GLM yes/no per resolved block (needs ZAI key) and strips rejected blocks. Backs up descriptions before writes."""
     stats = {k: 0 for k in ("marked", "strip", "rewrite", "same", "keep_unjudged",
-                            "keep_unresolved", "block_only", "fetch_failed", "gone", "nomarker", "error")}
+                            "keep_unresolved", "reject", "keep_unverified", "block_only", "fetch_failed", "gone", "nomarker", "error")}
     error_names = []
     backup = {}
     collected = {}  # --collect: {name: {"old", "new"}} instead of graph writes
     backup_file = CACHE_DIR / f"fixblocks_backup_{time.strftime('%Y%m%d-%H%M%S')}.json"
     suffix = " (dry-run)" if args.dry_run else ""
+    if args.verify:
+        _resume_gate(args.ignore_resume)
+        _glm["max"] = args.max_glm_tokens
+        if not ZAI_KEY:
+            log("FATAL: --verify needs ZAI_API_KEY.")
+            sys.exit(1)
+    verify_cache = load_verify_cache() if args.verify else {}
     if not args.dry_run and not args.collect:
         require_ollama()
 
@@ -848,6 +939,17 @@ async def fix_blocks(args):
                             log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
                             stats["keep_unresolved"] += 1
                             continue
+                        ok = await verify_match(client, name, facts, verify_cache) if args.verify else True
+                        if ok is None:
+                            log(f"[fix:keep-unverified] {name!r}")
+                            stats["keep_unverified"] += 1
+                            if _glm["stop"]:
+                                break  # GLM quota/budget: nothing further can be verified
+                            continue
+                        if not ok:
+                            stats["reject"] += 1
+                            reason = (f"verify-reject: CID {facts['cid']} {facts.get('formula')} "
+                                      f"({facts.get('iupac')})")
                         else:
                             new_block = format_block(facts)
                             old_block = BLOCK_RE.search(desc).group(0)
@@ -905,6 +1007,8 @@ async def fix_blocks(args):
         log("  nodes that hit [fix:error] (write may be partial; re-run --fix-blocks):")
         for n in error_names:
             log(f"    {n!r}")
+    if _glm["stop"]:
+        _write_resume_and_exit(names)
 
 
 # ---------------------------------------------------------------- selftest
@@ -1082,6 +1186,41 @@ async def _selftest_quota_stop():
         _not_judged.update(old_nj)
 
 
+async def _selftest_verify():
+    """verify_match: verdict cached per (name, CID) and saved, new CID re-asks, stop flag = None, no cache."""
+    global CACHE_DIR
+    import tempfile
+    answer, calls = ["NO"], []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={"choices": [{"message": {"content": answer[0]}}],
+                                         "usage": {"total_tokens": 10}})
+
+    old_dir, old_glm = CACHE_DIR, dict(_glm)
+    with tempfile.TemporaryDirectory() as tmp:
+        CACHE_DIR = Path(tmp)
+        _glm.update({"tokens": 0, "max": 0, "stop": None, "reset_at": None, "new": 0})
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+                cache = {}
+                go = {"cid": 297, "formula": "CH4", "iupac": "methane"}
+                assert await verify_match(c, "Graphene Oxide", go, cache) is False and len(calls) == 1
+                assert await verify_match(c, "Graphene Oxide", go, cache) is False and len(calls) == 1
+                assert load_verify_cache() == {"Graphene Oxide": {"cid": 297, "same": False}}
+                answer[0] = "YES"
+                assert await verify_match(c, "Graphene Oxide", dict(go, cid=1), cache) is True
+                assert len(calls) == 2
+                _glm["stop"] = "glm_quota"
+                water = {"cid": 962, "formula": "H2O", "iupac": "oxidane"}
+                assert await verify_match(c, "Water", water, cache) is None
+                assert len(calls) == 2 and "Water" not in cache
+        finally:
+            CACHE_DIR = old_dir
+            _glm.clear()
+            _glm.update(old_glm)
+
+
 def _selftest():
     p = _parse_judge
     assert p("COMPOUND: gallium") == {"decision": "compound", "canonical": "gallium"}
@@ -1090,6 +1229,8 @@ def _selftest():
     assert p("skip")["decision"] == "skip"
     assert p("no idea") is None
     assert p("COMPOUND:  ") is None
+    assert _parse_verify("YES") is True and _parse_verify("**yes**") is True
+    assert _parse_verify("No.") is False and _parse_verify("maybe") is None and _parse_verify(None) is None
 
     def pv(value):
         return {"Record": {"Section": [{"Information": [{"Value": value}]}]}}
@@ -1102,9 +1243,9 @@ def _selftest():
     assert _parse_mp(None) == "not available"
     d = _parse_mp(pv({"StringWithMarkup": [{"String": "1076 °F (Decomposes) (Loses H2O)"}]}))
     assert d == "not available", d
-    for n in ("C", "Portlandite", "C-S-H Gel", "Ettringite Formation"):
+    for n in ("C", "Portlandite", "C-S-H Gel", "Ettringite Formation", "Graphite", "HOPG", "Carbon", "Nanographite", "Graphene Oxide", "Carbon Black", "Diamond", "Multi-Walled CNTs"):
         assert _rule_skip(n), n
-    for n in ("Cu", "Sb", "O₂", "Gallium", "Paraffin Wax", "CaCO3", "Water"):
+    for n in ("Cu", "Sb", "O₂", "Gallium", "Paraffin Wax", "CaCO3", "Water", "Carbon Dioxide", "Graphitic Carbon Nitride", "Calcium Carbonate", "Fullerene C60"):
         assert not _rule_skip(n), n
 
     g = (f'<graphml xmlns="{GRAPHML_NS[1:-1]}">'
@@ -1125,6 +1266,7 @@ def _selftest():
         assert os.listdir(os.path.dirname(cf)) == ["c.json"]
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
+    asyncio.run(_selftest_verify())
     print("selftest OK")
 
 
@@ -1136,6 +1278,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="cap number of candidates (testing)")
     ap.add_argument("--fix-blocks", action="store_true",
                     help="clean existing blocks: strip rule-skipped, rewrite changed (no judge calls; --dry-run = log only)")
+    ap.add_argument("--verify", action="store_true",
+                    help="with --fix-blocks: GLM yes/no check of each resolved block, strip rejects (needs ZAI key; cached in verify.json)")
     ap.add_argument("--max-glm-tokens", type=int, default=0,
                     help="stop cleanly (exit 4) once GLM usage.total_tokens reaches N; 0 = no cap")
     ap.add_argument("--ignore-resume", action="store_true",
