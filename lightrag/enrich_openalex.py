@@ -20,6 +20,8 @@ USAGE:
   python enrich_openalex.py --dry-run  # enumerate+extract+search+judge, NO writes
   python enrich_openalex.py --refresh  # re-enrich nodes already marked
   python enrich_openalex.py --limit 10 # cap candidates (testing)
+  python enrich_openalex.py --collect FILE [--force]  # NO graph writes: collect {name: {old, new}} into FILE,
+                                       # then apply with ingest.ps1 -Root <base> -DescFile FILE
   python enrich_openalex.py --max-glm-tokens 500000  # stop cleanly at that many GLM tokens
   python enrich_openalex.py --ignore-resume  # run even if RESUME.json says the quota is still out
   python enrich_openalex.py --selftest # offline asserts (quota detector, stop flag, resume gate)
@@ -37,7 +39,8 @@ USAGE LIMITS (GLM z.ai Coding plan: rolling 5 h quota):
 
 EXIT CODES:
   0  finished (SUMMARY printed)
-  1  fatal precondition (ZAI_API_KEY / LIGHTRAG_API_KEY missing, graphml missing) or crash
+  1  fatal precondition (ZAI_API_KEY / LIGHTRAG_API_KEY missing, graphml missing; --collect with
+     --dry-run; --collect FILE exists without --force) or crash
   2  bad command-line arguments (argparse)
   4  stopped on GLM quota/budget (STOP block printed, RESUME.json written) or
      startup gate refused because reset_at is still in the future
@@ -159,6 +162,27 @@ def _save_json(path, obj):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _collect_guard(args):
+    """--collect startup checks, before any network work. FILE is never merged, only rebuilt."""
+    if not args.collect:
+        return
+    if args.dry_run:
+        log("FATAL: --collect already writes nothing to the graph; drop --dry-run")
+        sys.exit(1)
+    if os.path.exists(args.collect) and not args.force:
+        log(f"FATAL: {args.collect} exists; pass --force to overwrite (a collect file is never merged)")
+        sys.exit(1)
+
+
+def _save_collected(path, obj):
+    """Atomic write of the --collect file (tmp + os.replace); parent dir is created if missing."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 # ---------------------------------------------------------------- GLM usage limit (quota / budget stop)
@@ -663,6 +687,7 @@ async def run(args):
     sem = asyncio.Semaphore(2)
     processed = 0  # nodes fully handled this run (a node cut off by the stop is NOT counted)
     writes = 0     # successful /graph/entity/edit calls
+    collected = {}  # --collect: {name: {"old", "new"}} instead of graph writes
     n_ext = 0
 
     try:
@@ -727,9 +752,13 @@ async def run(args):
                     return
                 stripped = BLOCK_RE.sub("", desc).rstrip()
                 new_desc = (stripped + "\n\n" + block) if stripped else block
-                await write_entity(client, name, new_desc)
-                writes += 1
-                log(f"[enriched] {name!r} -> {work['id']} ({work['year']})")
+                if args.collect:
+                    collected[name] = {"old": desc, "new": new_desc}
+                    log(f"[collected] {name!r} -> {work['id']} ({work['year']})")
+                else:
+                    await write_entity(client, name, new_desc)
+                    writes += 1
+                    log(f"[enriched] {name!r} -> {work['id']} ({work['year']})")
                 stats["enriched"] += 1
 
             for name in names:
@@ -755,6 +784,8 @@ async def run(args):
         _save_json(EXTRACT_CACHE, extract_cache)
         _save_json(JUDGE_CACHE, judge_cache)
         _save_json(SEARCH_CACHE, search_cache)
+        if args.collect:  # a mid-loop kill or GLM stop still leaves a usable partial collect file
+            _save_collected(args.collect, collected)
 
     if _state["stop"]:
         remaining = len(names) - processed
@@ -766,6 +797,9 @@ async def run(args):
         for k, v in stats.items():
             log(f"  {k}: {v}")
         log(f"  resume: re-run the same command after reset_at (state in {RESUME})")
+        if args.collect:
+            log(f"  collect file {args.collect} holds a partial set; re-run with --force to rebuild it "
+                "after reset_at (caches make it cheap)")
         return 4
 
     log("\n==== SUMMARY ====")
@@ -774,6 +808,8 @@ async def run(args):
     log(f"  candidates: {len(names)}  extractable: {n_ext}  glm_tokens_used: {_state['tokens']}")
     if args.dry_run:
         log("  (dry-run: no writes performed)")
+    if args.collect:
+        log(f"  collected: {len(collected)} -> {args.collect}")
     return 0
 
 
@@ -866,6 +902,12 @@ def selftest():
         _set_stop("glm_budget")
         _write_resume(0, 1, 0)
         assert resume_gate(False) is False and not RESUME.exists()  # budget stop has no reset
+    # 4. _save_collected: round trip, parent dir made, no .tmp left
+    with tempfile.TemporaryDirectory() as td:
+        cf = os.path.join(td, "sub", "c.json")
+        _save_collected(cf, {"A": {"old": "", "new": "x"}})
+        assert json.loads(Path(cf).read_text(encoding="utf-8")) == {"A": {"old": "", "new": "x"}}
+        assert os.listdir(os.path.dirname(cf)) == ["c.json"]
     log("SELFTEST OK")
 
 
@@ -878,11 +920,15 @@ def main():
                     help="stop cleanly once this many GLM tokens were used this run (0 = no cap)")
     ap.add_argument("--ignore-resume", action="store_true",
                     help="run even if RESUME.json says the GLM quota is still exhausted")
+    ap.add_argument("--collect", metavar="FILE",
+                    help="collect new descriptions into FILE (JSON {name: {old, new}}) instead of writing the graph")
+    ap.add_argument("--force", action="store_true", help="with --collect: overwrite an existing FILE")
     ap.add_argument("--selftest", action="store_true", help="offline asserts, no network, then exit")
     args = ap.parse_args()
     if args.selftest:
         selftest()
         return
+    _collect_guard(args)
     if resume_gate(args.ignore_resume):
         sys.exit(4)
     sys.exit(asyncio.run(run(args)))

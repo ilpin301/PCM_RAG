@@ -20,13 +20,16 @@ USAGE:
   python enrich_pubchem.py --limit 10 # cap candidates (testing)
   python enrich_pubchem.py --fix-blocks            # clean existing blocks (strip/rewrite), needs no ZAI key
   python enrich_pubchem.py --fix-blocks --dry-run  # same, log only, NO writes
+  python enrich_pubchem.py --collect FILE [--force]  # NO graph writes: collect {name: {old, new}} into FILE,
+                                      # then apply with ingest.ps1 -Root <base> -DescFile FILE
+  python enrich_pubchem.py --fix-blocks --collect FILE  # same for block cleanup (no graph writes, no backup file)
   python enrich_pubchem.py --max-glm-tokens 500000  # stop cleanly once GLM has used N tokens (0 = no cap)
   python enrich_pubchem.py --ignore-resume  # start although RESUME.json says a quota stop is still active
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
 
 EXIT CODES:
   0  ok
-  1  fatal precondition (missing key / graphml)
+  1  fatal precondition (missing key / graphml; --collect with --dry-run; --collect FILE exists without --force)
   2  judge_error abort (>10% of names failed to judge)
   3  Ollama unreachable (write runs)
   4  stopped on GLM quota or --max-glm-tokens budget (resume later): judge.json is saved and
@@ -129,6 +132,27 @@ def require_ollama():
         log(f"FATAL: Ollama not reachable at {OLLAMA_URL} - the server needs it to embed "
             "edited descriptions; start Ollama first")
         sys.exit(3)
+
+
+def _collect_guard(args):
+    """--collect startup checks, before any network work. FILE is never merged, only rebuilt."""
+    if not args.collect:
+        return
+    if args.dry_run:
+        log("FATAL: --collect already writes nothing to the graph; drop --dry-run")
+        sys.exit(1)
+    if os.path.exists(args.collect) and not args.force:
+        log(f"FATAL: {args.collect} exists; pass --force to overwrite (a collect file is never merged)")
+        sys.exit(1)
+
+
+def _save_collected(path, obj):
+    """Atomic write of the --collect file (tmp + os.replace); parent dir is created if missing."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 # ---------------------------------------------------------------- step 1: enumerate
@@ -645,12 +669,13 @@ async def run(args):
     if not ZAI_KEY:
         log("FATAL: ZAI_API_KEY not set.")
         sys.exit(1)
-    if not args.dry_run:
+    if not args.dry_run and not args.collect:
         require_ollama()
 
     stats = {"enriched": 0, "skipped_judge": 0, "judge_error": 0, "unresolved": 0,
              "fetch_failed": 0, "gone": 0, "already": 0, "error": 0}
     error_names = []
+    collected = {}  # --collect: {name: {"old", "new"}} instead of graph writes
 
     cands = enumerate_candidates()
     names = list(cands.keys())
@@ -677,52 +702,60 @@ async def run(args):
             "good verdicts are cached.")
         sys.exit(2)
 
-    async with httpx.AsyncClient(trust_env=False) as client:
-        for name, canonical in compounds:
-            try:
-                # skip-check: already enriched (unless --refresh)
-                if not args.refresh:
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            for name, canonical in compounds:
+                try:
+                    # skip-check: already enriched (unless --refresh)
+                    if not args.refresh:
+                        desc = await fresh_description(client, name)
+                        if desc is None:
+                            log(f"[gone] {name!r}")
+                            stats["gone"] += 1
+                            continue
+                        if MARK_START in desc:
+                            log(f"[already] {name!r}")
+                            stats["already"] += 1
+                            continue
+
+                    facts = await pubchem_fetch(client, canonical)
+                    if not facts:
+                        log(f"[unresolved] {name!r} (canonical={canonical!r})")
+                        stats["unresolved"] += 1
+                        continue
+
+                    block = format_block(facts)
+                    if args.dry_run:
+                        log(f"[dry-run] would enrich {name!r} -> CID {facts['cid']} "
+                            f"mp={facts['mp']}")
+                        stats["enriched"] += 1
+                        continue
+
+                    # fresh read immediately before write (avoid stale clobber)
                     desc = await fresh_description(client, name)
                     if desc is None:
                         log(f"[gone] {name!r}")
                         stats["gone"] += 1
                         continue
-                    if MARK_START in desc:
-                        log(f"[already] {name!r}")
-                        stats["already"] += 1
-                        continue
-
-                facts = await pubchem_fetch(client, canonical)
-                if not facts:
-                    log(f"[unresolved] {name!r} (canonical={canonical!r})")
-                    stats["unresolved"] += 1
-                    continue
-
-                block = format_block(facts)
-                if args.dry_run:
-                    log(f"[dry-run] would enrich {name!r} -> CID {facts['cid']} "
-                        f"mp={facts['mp']}")
+                    stripped = BLOCK_RE.sub("", desc).rstrip()
+                    new_desc = (stripped + "\n\n" + block) if stripped else block
+                    if args.collect:
+                        collected[name] = {"old": desc, "new": new_desc}
+                        log(f"[collected] {name!r} -> CID {facts['cid']} mp={facts['mp']}")
+                    else:
+                        await write_entity(client, name, new_desc)
+                        log(f"[enriched] {name!r} -> CID {facts['cid']} mp={facts['mp']}")
                     stats["enriched"] += 1
-                    continue
-
-                # fresh read immediately before write (avoid stale clobber)
-                desc = await fresh_description(client, name)
-                if desc is None:
-                    log(f"[gone] {name!r}")
-                    stats["gone"] += 1
-                    continue
-                stripped = BLOCK_RE.sub("", desc).rstrip()
-                new_desc = (stripped + "\n\n" + block) if stripped else block
-                await write_entity(client, name, new_desc)
-                log(f"[enriched] {name!r} -> CID {facts['cid']} mp={facts['mp']}")
-                stats["enriched"] += 1
-            except FetchFailed:
-                log(f"[fetch_failed] {name!r} (canonical={canonical!r})")
-                stats["fetch_failed"] += 1
-            except Exception as e:
-                log(f"[error] {name!r}: {e}")
-                stats["error"] += 1
-                error_names.append(name)
+                except FetchFailed:
+                    log(f"[fetch_failed] {name!r} (canonical={canonical!r})")
+                    stats["fetch_failed"] += 1
+                except Exception as e:
+                    log(f"[error] {name!r}: {e}")
+                    stats["error"] += 1
+                    error_names.append(name)
+    finally:  # a mid-loop kill still leaves a usable partial collect file
+        if args.collect:
+            _save_collected(args.collect, collected)
 
     log("\n==== SUMMARY ====")
     for k, v in stats.items():
@@ -730,6 +763,8 @@ async def run(args):
     log(f"  candidates: {len(names)}  compounds: {len(compounds)}")
     if args.dry_run:
         log("  (dry-run: no writes performed)")
+    if args.collect:
+        log(f"  collected: {len(collected)} -> {args.collect}")
     if error_names:
         log("  nodes that hit [error] may carry a marker with a stale vector; "
             "re-run with --refresh:")
@@ -774,9 +809,10 @@ async def fix_blocks(args):
                             "keep_unresolved", "block_only", "fetch_failed", "gone", "nomarker", "error")}
     error_names = []
     backup = {}
+    collected = {}  # --collect: {name: {"old", "new"}} instead of graph writes
     backup_file = CACHE_DIR / f"fixblocks_backup_{time.strftime('%Y%m%d-%H%M%S')}.json"
     suffix = " (dry-run)" if args.dry_run else ""
-    if not args.dry_run:
+    if not args.dry_run and not args.collect:
         require_ollama()
 
     names = _marked_names()
@@ -784,77 +820,85 @@ async def fix_blocks(args):
     log(f"[fix] {len(names)} nodes carry a PubChem block")
     cache = load_judge_cache()
 
-    async with httpx.AsyncClient(trust_env=False) as client:
-        for name in names:
-            try:
-                desc = await fresh_description(client, name)
-                if desc is None:
-                    log(f"[fix:gone] {name!r}")
-                    stats["gone"] += 1
-                    continue
-                if MARK_START not in desc:
-                    log(f"[fix:nomarker] {name!r}")
-                    stats["nomarker"] += 1
-                    continue
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            for name in names:
+                try:
+                    desc = await fresh_description(client, name)
+                    if desc is None:
+                        log(f"[fix:gone] {name!r}")
+                        stats["gone"] += 1
+                        continue
+                    if MARK_START not in desc:
+                        log(f"[fix:nomarker] {name!r}")
+                        stats["nomarker"] += 1
+                        continue
 
-                new_block = None
-                if _rule_skip(name):
-                    reason = "rule-skip"
-                else:
-                    v = cache.get(name)
-                    if not (v and v.get("decision") == "compound" and v.get("canonical")):
-                        log(f"[fix:keep-unjudged] {name!r}")
-                        stats["keep_unjudged"] += 1
-                        continue
-                    facts = await pubchem_fetch(client, v["canonical"])
-                    if facts is None:  # resolution failure is never grounds to strip
-                        log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
-                        stats["keep_unresolved"] += 1
-                        continue
+                    new_block = None
+                    if _rule_skip(name):
+                        reason = "rule-skip"
                     else:
-                        new_block = format_block(facts)
-                        old_block = BLOCK_RE.search(desc).group(0)
-                        if new_block == old_block:
-                            log(f"[fix:same] {name!r}")
-                            stats["same"] += 1
+                        v = cache.get(name)
+                        if not (v and v.get("decision") == "compound" and v.get("canonical")):
+                            log(f"[fix:keep-unjudged] {name!r}")
+                            stats["keep_unjudged"] += 1
                             continue
-                        reason = None
+                        facts = await pubchem_fetch(client, v["canonical"])
+                        if facts is None:  # resolution failure is never grounds to strip
+                            log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
+                            stats["keep_unresolved"] += 1
+                            continue
+                        else:
+                            new_block = format_block(facts)
+                            old_block = BLOCK_RE.search(desc).group(0)
+                            if new_block == old_block:
+                                log(f"[fix:same] {name!r}")
+                                stats["same"] += 1
+                                continue
+                            reason = None
 
-                stripped = BLOCK_RE.sub("", desc).rstrip()
-                if new_block is None:
-                    if not stripped:  # LightRAG rejects empty descriptions
-                        log(f"[fix:block-only] {name!r}")
-                        stats["block_only"] += 1
-                        continue
-                    new_desc = stripped
-                    kind = "strip"
-                    log(f"[fix:strip] {name!r} ({reason}){suffix}")
-                else:
-                    new_desc = stripped + "\n\n" + new_block
-                    kind = "rewrite"
-                    log(f"[fix:rewrite] {name!r} mp: {_block_mp(old_block)} -> "
-                        f"{_block_mp(new_block)}{suffix}")
+                    stripped = BLOCK_RE.sub("", desc).rstrip()
+                    if new_block is None:
+                        if not stripped:  # LightRAG rejects empty descriptions
+                            log(f"[fix:block-only] {name!r}")
+                            stats["block_only"] += 1
+                            continue
+                        new_desc = stripped
+                        kind = "strip"
+                        log(f"{'[collected]' if args.collect else '[fix:strip]'} {name!r} ({reason}){suffix}")
+                    else:
+                        new_desc = stripped + "\n\n" + new_block
+                        kind = "rewrite"
+                        log(f"{'[collected]' if args.collect else '[fix:rewrite]'} {name!r} mp: "
+                            f"{_block_mp(old_block)} -> {_block_mp(new_block)}{suffix}")
 
-                if not args.dry_run:
-                    backup[name] = desc
-                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    backup_file.write_text(json.dumps(backup, ensure_ascii=False, indent=2),
-                                           encoding="utf-8")
-                    await write_entity(client, name, new_desc)
-                stats[kind] += 1
-            except FetchFailed:
-                log(f"[fix:fetch_failed] {name!r}")
-                stats["fetch_failed"] += 1
-            except Exception as e:
-                log(f"[fix:error] {name!r}: {e}")
-                stats["error"] += 1
-                error_names.append(name)
+                    if args.collect:  # the collect file itself carries "old": no backup file
+                        collected[name] = {"old": desc, "new": new_desc}
+                    elif not args.dry_run:
+                        backup[name] = desc
+                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                        backup_file.write_text(json.dumps(backup, ensure_ascii=False, indent=2),
+                                               encoding="utf-8")
+                        await write_entity(client, name, new_desc)
+                    stats[kind] += 1
+                except FetchFailed:
+                    log(f"[fix:fetch_failed] {name!r}")
+                    stats["fetch_failed"] += 1
+                except Exception as e:
+                    log(f"[fix:error] {name!r}: {e}")
+                    stats["error"] += 1
+                    error_names.append(name)
+    finally:  # a mid-loop kill still leaves a usable partial collect file
+        if args.collect:
+            _save_collected(args.collect, collected)
 
     log("\n==== FIX-BLOCKS SUMMARY ====")
     for k, v in stats.items():
         log(f"  {k}: {v}")
     if args.dry_run:
         log("  (dry-run: no writes performed)")
+    if args.collect:
+        log(f"  collected: {len(collected)} -> {args.collect}")
     if backup:
         log(f"  backup: {backup_file}")
     if error_names:
@@ -1073,6 +1117,12 @@ def _selftest():
     assert _block_mp(format_block({"cid": 1, "formula": "X", "mw": 1, "iupac": "x",
                                    "smiles": "C", "mp": "12.0 °C"})) == "12.0 °C"
     assert _block_mp("no block") == "?"
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:  # _save_collected: round trip, parent dir made, no .tmp left
+        cf = os.path.join(tmp, "sub", "c.json")
+        _save_collected(cf, {"A": {"old": "", "new": "x"}})
+        assert json.loads(Path(cf).read_text(encoding="utf-8")) == {"A": {"old": "", "new": "x"}}
+        assert os.listdir(os.path.dirname(cf)) == ["c.json"]
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     print("selftest OK")
@@ -1090,10 +1140,14 @@ def main():
                     help="stop cleanly (exit 4) once GLM usage.total_tokens reaches N; 0 = no cap")
     ap.add_argument("--ignore-resume", action="store_true",
                     help="start even if RESUME.json says a quota stop is still active")
+    ap.add_argument("--collect", metavar="FILE",
+                    help="collect new descriptions into FILE (JSON {name: {old, new}}) instead of writing the graph")
+    ap.add_argument("--force", action="store_true", help="with --collect: overwrite an existing FILE")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
+    _collect_guard(args)
     asyncio.run(fix_blocks(args) if args.fix_blocks else run(args))
 
 
