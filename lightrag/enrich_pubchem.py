@@ -44,6 +44,7 @@ import asyncio
 import json
 import os
 import re
+import statistics
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -65,7 +66,7 @@ CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
 VERIFY_FILE = "verify.json"  # under CACHE_DIR; GLM same-substance verdicts per (name, CID)
-FACTS_VERSION = 3  # bump when fact parsing changes; stale-version CID cache files are re-fetched
+FACTS_VERSION = 4  # 4: mp only from value-first strings / numbers; disagreeing values -> range
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 def _load_lightrag_key():
@@ -563,51 +564,79 @@ def _norm(s):
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
-def _parse_mp(pugview):
-    """First numeric value with unit °C; convert °F/K; range->low; else 'not available'."""
-    if not pugview:
-        return "not available"
-    strings = []
+MP_VALUE_RE = re.compile(
+    r"^\s*(?:(?:mp|m\.p\.|melting point|melting pt)\s*[:=]?\s*)?"
+    r"(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*(?:(?:-|to|–)\s*-?[\d,]+(?:\.\d+)?\s*)?(?:°\s*|deg\s*)?([CFK])\b",
+    re.IGNORECASE,
+)
+MP_AGREE_C = 5.0  # values within max(this, MP_AGREE_FRAC of the median in K) of the median agree
+MP_AGREE_FRAC = 0.02  # 2 % of absolute temperature: ~6 K near room temperature, ~46 K for Al2O3
+
+
+def _mp_to_c(value, unit):
+    """(°C, suffix) for a value in C/F/K."""
+    u = unit.upper()
+    if u == "F":
+        return (value - 32) * 5 / 9, " (converted from °F)"
+    if u == "K":
+        return value - 273.15, " (converted from K)"
+    return value, ""
+
+
+def _mp_values(pugview):
+    """Measured melting points in PubChem's Melting Point section as [(°C, unit C/F/K, text)], record order.
+    A string counts only when it STARTS with the value (after an optional 'mp:' label): narrative
+    sentences (e.g. 'At 260 K, a phase transition ...') and decomposition notes are ignored."""
+    out = []
+
+    def add(value, unit, raw):
+        c, suffix = _mp_to_c(value, unit)
+        text = f"{c:.1f} °C{suffix}" if suffix else f"{raw} °C"
+        out.append((c, unit.upper(), text))
 
     def walk(node):
         if isinstance(node, dict):
             info = node.get("Information")
             if isinstance(info, list):
                 for item in info:
-                    val = item.get("Value", {})
+                    val = item.get("Value", {}) or {}
                     for sm in val.get("StringWithMarkup", []) or []:
-                        if sm.get("String"):
-                            strings.append(sm["String"])
+                        s = sm.get("String") or ""
+                        if "decompos" in s.lower():
+                            continue
+                        m = MP_VALUE_RE.match(s)
+                        if m:
+                            num = m.group(1).replace(",", "")
+                            add(float(num), m.group(2), num)
                     if "Number" in val:
-                        unit = val.get("Unit", "")
-                        nums = val["Number"]
-                        if not isinstance(nums, list):
-                            nums = [nums]
-                        for num in nums:
-                            strings.append(f"{num} {unit}")
+                        unit = (val.get("Unit") or "").replace("°", "").strip()
+                        if unit.upper() in ("C", "F", "K"):
+                            nums = val["Number"] if isinstance(val["Number"], list) else [val["Number"]]
+                            for num in nums:
+                                add(float(num), unit, num)
             for sec in node.get("Section", []) or []:
                 walk(sec)
 
-    walk(pugview.get("Record", {}))
-    for s in strings:
-        low = s.lower()
-        if "decompos" in low:
-            continue
-        m = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:-|to|–)?\s*(?:-?\d+(?:\.\d+)?)?\s*°?\s*c\b", low)
-        if m:
-            return f"{m.group(1)} °C"
-    for s in strings:
-        low = s.lower()
-        if "decompos" in low:
-            continue
-        m = re.search(r"(-?\d+(?:\.\d+)?)\s*°?\s*f\b", low)
-        if m:
-            c = (float(m.group(1)) - 32) * 5 / 9
-            return f"{c:.1f} °C (converted from °F)"
-        m = re.search(r"(-?\d+(?:\.\d+)?)\s*k\b", low)
-        if m:
-            return f"{float(m.group(1)) - 273.15:.1f} °C (converted from K)"
-    return "not available"
+    if pugview:
+        walk(pugview.get("Record", {}))
+    return out
+
+
+def _parse_mp(pugview):
+    """Consensus melting point. Uses the °C entries when there are any (PubChem's °F/K entries are
+    mostly CAMEO/NIOSH conversions), else the °F/K ones. The first value within the tolerance of the
+    median wins, but only when MORE than half of the values agree: a scattered record (polymorphs,
+    hydrates, stray numbers) gives 'not available', never a guess or a range."""
+    vals = _mp_values(pugview)
+    vals = [v for v in vals if v[1] == "C"] or vals
+    if not vals:
+        return "not available"
+    med = statistics.median(c for c, _, _ in vals)
+    tol = max(MP_AGREE_C, MP_AGREE_FRAC * (med + 273.15))
+    near = [v for v in vals if abs(v[0] - med) <= tol]
+    if 2 * len(near) <= len(vals):
+        return "not available"
+    return near[0][2]
 
 
 async def pubchem_fetch(client, canonical):
@@ -1243,6 +1272,29 @@ def _selftest():
     assert _parse_mp(None) == "not available"
     d = _parse_mp(pv({"StringWithMarkup": [{"String": "1076 °F (Decomposes) (Loses H2O)"}]}))
     assert d == "not available", d
+    narrative = "At 260 K, a first-order phase transition from fcc to simple cubic is observed."
+    assert _parse_mp(pv({"StringWithMarkup": [{"String": narrative}]})) == "not available"
+    assert _parse_mp(pv({"StringWithMarkup": [{"String": "MP: 44.2 °C"}]})) == "44.2 °C"
+    assert _parse_mp(pv({"StringWithMarkup": [{"String": "about 44 °C"}]})) == "not available"
+    assert _parse_mp(pv({"StringWithMarkup": [{"String": "43-45 °C"}]})) == "43 °C"
+
+    def pvs(*strings):
+        return {"Record": {"Section": [{"Information": [
+            {"Value": {"StringWithMarkup": [{"String": s}]}} for s in strings]}]}}
+    assert _parse_mp(pvs("43.8 °C", "111 °F (NTP, 1992)")) == "43.8 °C"  # agree within 5 °C
+    assert _parse_mp(pvs("46 °C", "68 °C")) == "not available"  # two values disagree, no majority
+    assert _parse_mp(pvs(narrative, "1180 °C")) == "1180 °C"
+    assert _parse_mp(pvs("609.6 °F (NTP, 1992)", "610 °F", "32.0691 °C", "321 °C", "321 °C")) == "321 °C"  # outlier
+    assert _parse_mp(pvs("1220 °F (NIOSH, 2024)", "660 °C")) == "660 °C"  # °C entries preferred over °F
+    assert _parse_mp(pvs("2,446 °C")) == "2446 °C"  # thousands separator
+    assert _parse_mp(pvs("3632 °F (NIOSH, 2024)", "2030 °C", "2054 °C", "3632 °F", "2072 °C")) == "2030 °C"  # 2 % of K at high T
+    assert _parse_mp(pvs("160 °C", "MP: 150-155 °C", "156 - 157 °C", "150-157 °C", "153 °C")) == "160 °C"
+    assert _parse_mp(pvs("greater than 572 °F (NTP, 1992)")) == "not available"  # lower bound only
+    assert _parse_mp(pvs("> 300 °C")) == "not available"
+    assert _parse_mp(pvs("13.4 °C", "42 - 44 °C")) == "not available"
+    assert _block_mp(format_block({"cid": 1, "formula": "X", "mw": 1, "iupac": "x", "smiles": "C",
+                                   "mp": "46.0 to 68.0 °C (range of PubChem values)"})) \
+        == "46.0 to 68.0 °C (range of PubChem values)"
     for n in ("C", "Portlandite", "C-S-H Gel", "Ettringite Formation", "Graphite", "HOPG", "Carbon", "Nanographite", "Graphene Oxide", "Carbon Black", "Diamond", "Multi-Walled CNTs"):
         assert _rule_skip(n), n
     for n in ("Cu", "Sb", "O₂", "Gallium", "Paraffin Wax", "CaCO3", "Water", "Carbon Dioxide", "Graphitic Carbon Nitride", "Calcium Carbonate", "Fullerene C60"):
