@@ -110,7 +110,18 @@ main agent has put everything you need in the task prompt.
 3. **Build the command.** Base:
    `NO_PROXY='*' python enrich_pubchem.py`
    Append flags per inputs: `--dry-run` if MODE=dry; `--fix-blocks --dry-run` if MODE=fix-dry; `--fix-blocks` if MODE=fix; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes; `--max-glm-tokens <GLM_TOKEN_BUDGET>` if given.
-   Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; pass timeout 600000 to the Bash tool for short runs). A `full` run over the current graph judges ~2123 uncached names (~3 h): launch it in the BACKGROUND with a long timeout, redirect output to `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_pubchem.log`, poll the log, and delete the log file if the script exits with code 0. Tell the main agent in your report that a full finish may need the main agent to carry it beyond your wall-clock. Run ONLY ONE instance at a time.
+   Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (the judge + PubChem calls are rate-limited; pass timeout 600000 to the Bash tool for short runs). A `full` run judges ~2000+ uncached names and runs for hours. Launch every run longer than ~10 min with the DETACHED LAUNCH recipe below, never with the Bash/PowerShell tool's `run_in_background`: a harness background task is hard-killed at its timeout (max 2 h) and takes the python process with it (2026-09-30: a full run died silently at exactly 2 h 00 min, mid-write, no traceback, no RESUME.json).
+
+   **DETACHED LAUNCH (native PowerShell tool):**
+   ```powershell
+   $env:NO_PROXY = '*'
+   $lr = 'X:\RAG_MAIN\PCM_RAG\lightrag'
+   $p = Start-Process python -ArgumentList (@('enrich_pubchem.py') + $flags) -WorkingDirectory $lr -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput "$lr\LOG\enrich_pubchem.log" -RedirectStandardError "$lr\LOG\enrich_pubchem.err"
+   $p.Id
+   ```
+   `$flags` = the flags from above as a string array. The process survives the tool shell exiting (proven 2026-09-30: PID alive 30+ min after its parent shell was gone). Put the PID into `RUN_STATE.json` as `pid`. On a relaunch after a kill, use new log names (`enrich_pubchem_resume.log/.err`) so the first log is kept.
+   **Waiting:** foreground PowerShell calls only, each under 10 min (timeout 600000), each a silent loop `while (Get-Process -Id $runPid -ErrorAction SilentlyContinue) { Start-Sleep 30 }` (`$runPid` = the PID from RUN_STATE.json; never `$pid`, which is PowerShell's own process id) with a deadline of ~9 min; repeat the call until the PID is gone. No output per iteration. Exit code: the script's SUMMARY block / `.err` contents (Start-Process -PassThru ExitCode is lost once the tool shell exits). A PID gone with no SUMMARY and an empty `.err` = killed from outside: report it, do not assume success. Delete the log/.err only if the SUMMARY is present and there were no errors. Run ONLY ONE instance at a time.
    The script has its own fail-fast guard: on a write run it exits 3 with `FATAL: Ollama not reachable ...` if Ollama is down. Treat that as a preflight failure, not a script bug.
 
 4. **Capture + interpret.** The script prints per-node lines (`[enriched]`, `[skipped_judge]`, `[unresolved]`, `[gone]`, `[already]`, `[error]`; fix modes print `[fix:strip]`, `[fix:rewrite]`, `[fix:same]`, `[fix:keep-*]`, `[fix:error]`) and ends with an `==== SUMMARY ====` (or `==== FIX-BLOCKS SUMMARY ====`) block of counts plus `candidates:` / `compounds:`. Read those counts.
@@ -132,8 +143,8 @@ main agent has put everything you need in the task prompt.
 - z.ai 1305 is a concurrency limit, not quota: the script backs off and retries by itself.
 
 **Claude session (5-hour limit).**
-- The enrichment job uses no Claude tokens. Always launch it detached (`run_in_background`) so a Claude session hitting its limit does not stop it. Never poll; wait for the completion notice.
-- BEFORE launching, write `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RUN_STATE.json` with `{started_at, mode, command, log_path, push_owed}`; `push_owed` is `true` for writing modes (full, fix), `false` for dry modes.
+- The enrichment job uses no Claude tokens. Always launch it with the DETACHED LAUNCH recipe (step 3), never `run_in_background` (2 h hard kill), so neither a harness timeout nor a Claude session hitting its limit stops it. Wait only with the silent PID loop from step 3; no progress notifications.
+- BEFORE launching, write `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RUN_STATE.json` with `{started_at, mode, command, log_path, pid, push_owed}`; `push_owed` is `true` for writing modes (full, fix), `false` for dry modes.
 - The next session (or this one when notified of completion) reads the log and `RUN_STATE.json`, reports the result, does the owed Drive push (step 6), then sets `push_owed` to `false`.
 - If the Claude session is close to its limit, hand off (the job keeps running) rather than stopping the job, which would waste progress.
 

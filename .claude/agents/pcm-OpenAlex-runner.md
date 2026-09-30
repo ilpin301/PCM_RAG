@@ -121,7 +121,7 @@ main agent has put everything you need in the task prompt.
    `NO_PROXY='*' python enrich_openalex.py`
    Append flags per inputs: `--dry-run` if MODE=dry; `--limit <LIMIT>` if LIMIT given; `--refresh` if REFRESH=yes; `--max-glm-tokens <GLM_TOKEN_BUDGET>` if given.
    Run it from `X:\RAG_MAIN\PCM_RAG\lightrag`. Use a generous timeout (extraction + judge LLM calls are concurrency-capped at 2 and OpenAlex is throttled; allow up to 10 minutes — pass timeout 600000 to the Bash tool).
-   A **full run** over ~460 refs takes FAR longer than any subagent wall-clock — a prior full run was killed ~22 min in and was nowhere near done. So for a full run: launch the command DETACHED in the background and poll its log file / caches rather than blocking on it. Explicitly tell the main agent in your report that a full FINISH may need the **main agent** to run the command directly in the background (outside this time-limited subagent) — you can start it and confirm progress, but you likely cannot see it through to completion.
+   A **full run** over ~460 refs takes FAR longer than any subagent wall-clock — a prior full run was killed ~22 min in and was nowhere near done. So for a full run: launch it with `Start-Process` from the native PowerShell tool, NEVER the Bash/PowerShell tool's `run_in_background` - a harness background task is hard-killed at its timeout (max 2 h) and kills python with it (proven on the PubChem runner 2026-09-30: died at exactly 2 h 00 min, no traceback). Recipe: `$env:NO_PROXY='*'; $lr='X:\RAG_MAIN\PCM_RAG\lightrag'; $p = Start-Process python -ArgumentList (@('enrich_openalex.py') + $flags) -WorkingDirectory $lr -WindowStyle Hidden -PassThru -RedirectStandardOutput "$lr\LOG\enrich_openalex.log" -RedirectStandardError "$lr\LOG\enrich_openalex.err"; $p.Id`. It survives the tool shell exiting; record the PID in RUN_STATE.json as `pid`. The watchdog below runs as foreground calls under 10 min each (timeout 600000), repeated until the PID is gone; a gone PID with no SUMMARY and empty `.err` = killed from outside, report it. Explicitly tell the main agent in your report that a full FINISH may need the **main agent** to run the command directly in the background (outside this time-limited subagent) — you can start it and confirm progress, but you likely cannot see it through to completion.
    Log file for background/detached runs: `X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_openalex.log`. Redirect stdout+stderr there when running detached. Delete the log file if the script exits with code 0 (success).
    Run ONLY ONE instance at a time.
    **Git-Bash quirk (NOT a bug):** under Git-Bash, `python` shows up as TWO `python.exe` processes (the launcher + its child) and BOTH inherit the redirected stdout, so the log output is DOUBLED — you will see two `[enumerate]` headers. This is cosmetic; it is NOT two competing runs. Do not panic and do not kill "the duplicate".
@@ -168,9 +168,9 @@ After launching the script detached (background), enter a monitor loop until one
 - Restart counter ≥ 5 → too many restarts, likely a persistent error. STOP and report.
 - Subagent wall-clock budget exhausted → report current progress (line count, restart count, last 5 log lines) and tell the main agent to continue monitoring manually with `Get-Content X:\RAG_MAIN\PCM_RAG\lightrag\LOG\enrich_openalex.log -Wait` and kill/restart manually if it hangs again.
 
-**Implementation note:** use PowerShell with a `while` loop and `Start-Sleep -Seconds 60` for the polling. Track prev_count and hang_count variables. Use `(Get-Content $log -ErrorAction SilentlyContinue).Count` for line count. Use `Get-Process -Id $pid -ErrorAction SilentlyContinue` to check if process alive.
+**Implementation note:** use PowerShell with a `while` loop and `Start-Sleep -Seconds 60` for the polling. Track prev_count and hang_count variables. Use `(Get-Content $log -ErrorAction SilentlyContinue).Count` for line count. Use `Get-Process -Id $runPid -ErrorAction SilentlyContinue` to check if process alive (`$runPid` = the PID from RUN_STATE.json; never `$pid`, which is PowerShell's own process id).
 
-On restart, use `>>` (append) redirect for the log so history is preserved across restarts.
+On restart, relaunch with the same Start-Process recipe but new log names (`enrich_openalex_resume.log/.err`) so history is preserved - Start-Process cannot append.
 
 ## OpenAlex daily budget (STOP condition — not a hang)
 OpenAlex meters a free daily budget (~$0.10 / 1000 credits, ~$0.001 per /works search). When it is exhausted, EVERY uncached search returns HTTP 429 with body `{"error":"Rate limit exceeded","message":"Insufficient budget... Resets at midnight UTC"}` and headers `Retry-After: ~30000s` (~8.5h) and `x-ratelimit-remaining: 0`.
@@ -202,9 +202,9 @@ The script has a rolling z.ai (glm-5.3, 5-hour) limit to live with; it uses NO C
 - If `writes_done` > 0 the Drive push is STILL OWED: do it per "Drive backup after writes" (step 5) - a quota stop that wrote nodes still counts as having writes. If the run is still going elsewhere or you cannot push, say so.
 - Resume = re-run the SAME command (same flags); caches and the `<!--OPENALEX_START-->` marker make the replay cheap and idempotent. `RESUME.json` is deleted by the script when the resumed run starts.
 
-**Claude side.** The job runs detached (`run_in_background`) and needs no Claude tokens, so a Claude 5-hour session limit must not stop it.
+**Claude side.** The job runs detached (`Start-Process`, never `run_in_background`) and needs no Claude tokens, so a Claude 5-hour session limit must not stop it.
 - Never poll with repeated model turns or progress notifications: use the single in-shell watchdog loop above, or one silent one-shot waiter that exits on completion, and report once when the job ends.
-- Before launching, write `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RUN_STATE.json` = `{started_at, mode, command, log_path, push_owed}` (`push_owed` true for MODE=full). A later session reads it to report, does any owed push, then sets `push_owed` false.
+- Before launching, write `X:\RAG_MAIN\PCM_RAG\lightrag\data\enrich_cache\RUN_STATE.json` = `{started_at, mode, command, log_path, pid, push_owed}` (`push_owed` true for MODE=full). A later session reads it to report, does any owed push, then sets `push_owed` false.
 - If the Claude session is near its limit, hand off (report the RUN_STATE.json path, log path, and whether a push is owed) rather than stopping the job.
 
 ## If writes fail with HTTP 500
