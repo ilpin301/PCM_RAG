@@ -543,6 +543,7 @@ async def _throttle():
 
 RETRY_STATUS = (429, 500, 502, 503, 504)
 PUBCHEM_ATTEMPTS = 5
+NOTFOUND_RETRY_S = 60  # --fix-blocks: PubChem briefly answers NotFound for names it has (seen in 15-40 s windows)
 
 
 def _fault_code(r):
@@ -661,11 +662,23 @@ def _parse_mp(pugview):
     return near[0][2]
 
 
-async def pubchem_fetch(client, canonical):
+async def _cid_lookup(client, canonical, notfound_retries=0):
+    """Name -> CID JSON via _pubchem_get; a NotFound (None) is retried notfound_retries times after
+    NOTFOUND_RETRY_S. Only --fix-blocks retries: its names all resolved once, so a NotFound there is
+    usually a PubChem hiccup, while a normal run meets many genuine not-founds."""
+    url = f"{PUBCHEM}/rest/pug/compound/name/{httpx.URL(canonical)}/cids/JSON"
+    cid_json = await _pubchem_get(client, url)
+    for _ in range(notfound_retries):
+        if cid_json is not None:
+            break
+        await _sleep(NOTFOUND_RETRY_S)
+        cid_json = await _pubchem_get(client, url)
+    return cid_json
+
+
+async def pubchem_fetch(client, canonical, notfound_retries=0):
     """Resolve canonical name to a confidence-checked CID + facts, or None (unresolved)."""
-    cid_json = await _pubchem_get(
-        client, f"{PUBCHEM}/rest/pug/compound/name/{httpx.URL(canonical)}/cids/JSON"
-    )
+    cid_json = await _cid_lookup(client, canonical, notfound_retries)
     if cid_json is None:
         return None
     try:
@@ -1006,7 +1019,7 @@ async def fix_blocks(args):
                             log(f"[fix:keep-unjudged] {name!r}")
                             stats["keep_unjudged"] += 1
                             continue
-                        facts = await pubchem_fetch(client, v["canonical"])
+                        facts = await pubchem_fetch(client, v["canonical"], notfound_retries=2)
                         if facts is None:  # resolution failure is never grounds to strip
                             log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
                             stats["keep_unresolved"] += 1
@@ -1161,6 +1174,23 @@ async def _selftest_fetch():
         assert await run((200, timeout), (200, ok)) == (ok, 2)  # non-busy Fault on a 200 is retried
         assert await run((200, srverr)) == ("FetchFailed", PUBCHEM_ATTEMPTS)
         assert await run((200, {"Fault": {"Code": "PUGREST.NotFound"}})) == (None, 1)
+        # _cid_lookup: PubChem briefly answers NotFound for names it has; --fix-blocks retries
+        seq = iter([(404, {}), (200, ok)])
+        lookups = []
+
+        def lookup_handler(request):
+            lookups.append(1)
+            status, body = next(seq)
+            return httpx.Response(status, json=body)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lookup_handler)) as c:
+            assert await _cid_lookup(c, "water", 2) == ok and len(lookups) == 2
+        seq = iter([(404, {})] * 5)
+        lookups.clear()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lookup_handler)) as c:
+            assert await _cid_lookup(c, "water", 0) is None and len(lookups) == 1
+            lookups.clear()
+            assert await _cid_lookup(c, "water", 2) is None and len(lookups) == 3
         await _selftest_pubchem_fetch()
     finally:
         PUBCHEM_MIN_INTERVAL, _sleep = old_int, old_sleep
