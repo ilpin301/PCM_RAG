@@ -33,6 +33,14 @@
   bases by 2026-09-16.
 - Verify every ingest with: doc count delta, graph node delta, vector sanity check, and one targeted query.
 - Record every ingested SOURCE in `lightrag\INGESTED_SOURCES.txt`, not the slice names.
+- **Enrichment blocks around ingests (leak guard).** LightRAG's merge summary absorbs
+  `<!--PUBCHEM_START-->` blocks into plain prose when an ingest re-mentions an enriched entity.
+  Before the FIRST source of an ingest queue: `python lightrag\enrich_pubchem.py --fix-blocks --strip-all
+  --collect lightrag\data\enrich_cache\pending_strip_all.json --force`, then apply it with
+  `ingest.ps1 -DescFile` (push rules apply). After the LAST source is verified: pcm-PubChem-runner
+  MODE=full (re-adds blocks from the judge/verify/PubChem caches; only new entities cost GLM calls),
+  then `python lightrag\enrich_pubchem.py --scan-leaks` must exit 0. Exit 7 = leaked facts: clean them
+  as in docs/superpowers/plans/2026-09-30-rag-data-integrity.md Task 4 before anything else.
 
 ## This base
 - Server `pcm_rag-lightrag-1`, port 9622, `COMPOSE_PROJECT_NAME=pcm_rag` in `lightrag\.env`.
