@@ -24,6 +24,8 @@ USAGE:
                                       # then apply with ingest.ps1 -Root <base> -DescFile FILE
   python enrich_pubchem.py --fix-blocks --collect FILE  # same for block cleanup (no graph writes, no backup file)
   python enrich_pubchem.py --fix-blocks --verify [--collect FILE]  # also GLM-verify each resolved block, strip rejects
+  python enrich_pubchem.py --fix-blocks --strip-all --collect FILE [--force]  # strip EVERY block (before an ingest; re-add after)
+  python enrich_pubchem.py --scan-leaks  # list descriptions with PubChem/OpenAlex facts outside the blocks
   python enrich_pubchem.py --max-glm-tokens 500000  # stop cleanly once GLM has used N tokens (0 = no cap)
   python enrich_pubchem.py --ignore-resume  # start although RESUME.json says a quota stop is still active
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
@@ -38,6 +40,7 @@ EXIT CODES:
      Re-run the same command after reset_at; judged names, PubChem cache and graph markers skip finished work.
      With the verify step (normal runs, --fix-blocks --verify) it can also stop mid-loop; a --collect FILE
      then holds verified entries only - re-collect after reset_at instead of applying it.
+  7  --scan-leaks found leaked facts outside the blocks
 """
 import argparse
 import asyncio
@@ -99,6 +102,13 @@ PUBCHEM_HEADERS = {
 MARK_START = "<!--PUBCHEM_START-->"
 MARK_END = "<!--PUBCHEM_END-->"
 BLOCK_RE = re.compile(r"<!--PUBCHEM_START-->.*?<!--PUBCHEM_END-->", re.DOTALL)
+OPENALEX_BLOCK_RE = re.compile(r"<!--OPENALEX_START-->.*?<!--OPENALEX_END-->", re.DOTALL)
+LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID\s*\d+", re.IGNORECASE)  # enrichment facts outside a block
+
+
+def _leak_text(desc):
+    """Description text outside both enrichment blocks."""
+    return OPENALEX_BLOCK_RE.sub("", BLOCK_RE.sub("", desc or ""))
 
 TYPE_PATH = {"naturalobject", "material", "substance"}
 REGEX_TYPES = {"concept", "artifact"}
@@ -916,6 +926,23 @@ def _marked_names():
     return names
 
 
+def scan_leaks():
+    """'node <name>' / 'edge <src> -> <tgt>' for every description mentioning PubChem/OpenAlex/CID
+    outside the marked blocks: an ingest's LLM merge summary absorbed a block into prose."""
+    if not GRAPHML.exists():
+        log(f"FATAL: graphml not found at {GRAPHML}")
+        sys.exit(1)
+    root = ET.parse(GRAPHML).getroot()
+    desc_keys = {k.get("id") for k in root.iter(GRAPHML_NS + "key") if k.get("attr.name") == "description"}
+    hits = []
+    for el in list(root.iter(GRAPHML_NS + "node")) + list(root.iter(GRAPHML_NS + "edge")):
+        for data in el.findall(GRAPHML_NS + "data"):
+            if data.get("key") in desc_keys and LEAK_RE.search(_leak_text(data.text)):
+                hits.append(f"node {el.get('id')}" if el.get("id") is not None
+                            else f"edge {el.get('source')} -> {el.get('target')}")
+    return hits
+
+
 async def fix_blocks(args):
     """Clean existing PubChem blocks: strip rule-skipped nodes, rewrite changed blocks, keep unjudged and unresolved. No judge calls. --verify adds one cached GLM yes/no per resolved block (needs ZAI key) and strips rejected blocks. Backs up descriptions before writes."""
     stats = {k: 0 for k in ("marked", "strip", "rewrite", "same", "keep_unjudged",
@@ -955,7 +982,9 @@ async def fix_blocks(args):
                         continue
 
                     new_block = None
-                    if _rule_skip(name):
+                    if args.strip_all:
+                        reason = "strip-all"
+                    elif _rule_skip(name):
                         reason = "rule-skip"
                     else:
                         v = cache.get(name)
@@ -1251,6 +1280,9 @@ async def _selftest_verify():
 
 
 def _selftest():
+    global GRAPHML
+    import tempfile
+    from xml.sax.saxutils import escape
     p = _parse_judge
     assert p("COMPOUND: gallium") == {"decision": "compound", "canonical": "gallium"}
     assert p("Sure! compound: `silver(I) oxide`.")["canonical"] == "silver(I) oxide"
@@ -1310,12 +1342,30 @@ def _selftest():
     assert _block_mp(format_block({"cid": 1, "formula": "X", "mw": 1, "iupac": "x",
                                    "smiles": "C", "mp": "12.0 °C"})) == "12.0 °C"
     assert _block_mp("no block") == "?"
-    import tempfile
     with tempfile.TemporaryDirectory() as tmp:  # _save_collected: round trip, parent dir made, no .tmp left
         cf = os.path.join(tmp, "sub", "c.json")
         _save_collected(cf, {"A": {"old": "", "new": "x"}})
         assert json.loads(Path(cf).read_text(encoding="utf-8")) == {"A": {"old": "", "new": "x"}}
         assert os.listdir(os.path.dirname(cf)) == ["c.json"]
+    blk = format_block({"cid": 962, "formula": "H2O", "mw": 18, "iupac": "oxidane", "smiles": "O", "mp": "0 °C"})
+    assert not LEAK_RE.search(_leak_text("Water is a PCM.\n\n" + blk))
+    assert LEAK_RE.search(_leak_text("Ice melts at 0 °C (PubChem CID 962)."))
+    assert not LEAK_RE.search(_leak_text("x <!--OPENALEX_START-->OpenAlex W1<!--OPENALEX_END-->"))
+    assert LEAK_RE.search(_leak_text("Cited 12 times per OpenAlex."))
+    old_g = GRAPHML
+    with tempfile.TemporaryDirectory() as tmp:
+        GRAPHML = Path(tmp) / "g.graphml"
+        GRAPHML.write_text(
+            f'<graphml xmlns="{GRAPHML_NS[1:-1]}"><key id="d1" for="node" attr.name="description"/>'
+            '<key id="e1" for="edge" attr.name="description"/><graph>'
+            '<node id="Ice"><data key="d1">Ice (PubChem CID 962) melts at 0 °C.</data></node>'
+            f'<node id="Water"><data key="d1">Water.\n\n{escape(blk)}</data></node>'
+            '<edge source="Ice" target="Water"><data key="e1">Ice melts to water.</data></edge>'
+            '</graph></graphml>', encoding="utf-8")
+        try:
+            assert scan_leaks() == ["node Ice"], scan_leaks()
+        finally:
+            GRAPHML = old_g
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     asyncio.run(_selftest_verify())
@@ -1339,10 +1389,23 @@ def main():
     ap.add_argument("--collect", metavar="FILE",
                     help="collect new descriptions into FILE (JSON {name: {old, new}}) instead of writing the graph")
     ap.add_argument("--force", action="store_true", help="with --collect: overwrite an existing FILE")
+    ap.add_argument("--strip-all", action="store_true",
+                    help="with --fix-blocks --collect: strip EVERY PubChem block (before an ingest; re-add after)")
+    ap.add_argument("--scan-leaks", action="store_true",
+                    help="list descriptions with PubChem/OpenAlex facts outside the blocks; exit 7 if any")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
         return
+    if args.scan_leaks:
+        hits = scan_leaks()
+        for h in hits:
+            log(f"[leak] {h}")
+        log(f"leaks: {len(hits)}")
+        sys.exit(7 if hits else 0)
+    if args.strip_all and not (args.fix_blocks and args.collect):
+        log("FATAL: --strip-all needs --fix-blocks --collect FILE")
+        sys.exit(1)
     _collect_guard(args)
     asyncio.run(fix_blocks(args) if args.fix_blocks else run(args))
 
