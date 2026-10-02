@@ -103,7 +103,8 @@ MARK_START = "<!--PUBCHEM_START-->"
 MARK_END = "<!--PUBCHEM_END-->"
 BLOCK_RE = re.compile(r"<!--PUBCHEM_START-->.*?<!--PUBCHEM_END-->", re.DOTALL)
 OPENALEX_BLOCK_RE = re.compile(r"<!--OPENALEX_START-->.*?<!--OPENALEX_END-->", re.DOTALL)
-LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID[:#]?\s*\d+|\bSMILES\b|\bIUPAC\b|\bMW\s*\d+(?:[.,]\d+)?\s*g/mol", re.IGNORECASE)  # enrichment facts outside a block, incl. paraphrase
+LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID\s*[:#]?\s*\d+|\bSMILES\b|\bIUPAC\b|\bInChI(?:Key)?\b|\b[A-Z]{14}-[A-Z]{10}-[A-Z]\b"
+                     r"|\b(?:MW|molecular (?:weight|mass))\s*(?:of|is|:|=)?\s*\d+(?:[.,]\d+)?\s*g/mol", re.IGNORECASE)  # enrichment facts outside a block, incl. paraphrase
 
 
 def _leak_text(desc):
@@ -1403,6 +1404,14 @@ def _selftest():
               "Water. " + blk.replace("PubChem", "PubChem facts SMILES IUPAC MW 18 g/mol CID: 962")):
         assert not LEAK_RE.search(_leak_text(t)), t
     assert LEAK_RE.search(_leak_text("PubChem facts: Formula Al."))
+    for t in ("InChI=1S/H2O/h1H2.", "InChIKey XLYOFNOQVPJJNP-UHFFFAOYSA-N.", "Key XLYOFNOQVPJJNP-UHFFFAOYSA-N.",
+              "The molecular weight of 18.015 g/mol.", "Its molecular mass is 18.015 g/mol.", "Ice (CID : 962).",
+              "x <!--OPENALEX_START-->ok<!--OPENALEX_END--> InChI=1S/H2O"):
+        assert LEAK_RE.search(_leak_text(t)), t
+    for t in ("The molecular weight of polyethylene glycol is high.", "Molecular weight distribution was narrow.",
+              "Water. " + blk.replace("PubChem", "PubChem InChI=1S/H2O XLYOFNOQVPJJNP-UHFFFAOYSA-N"),
+              "x <!--OPENALEX_START-->InChI=1S/H2O<!--OPENALEX_END-->"):
+        assert not LEAK_RE.search(_leak_text(t)), t
     mpv = pvs("135 °C (dec.)", "180 °C sublimes", "56.6 °C at the triple point", "99 °C (decomposes)", "58.5 °C")
     assert [v[2] for v in _mp_values(mpv)] == ["58.5 °C"], _mp_values(mpv)
     for marker in ("(dec.)", "dec.", "(dec)", "decomposes", "with decomposition", "sublimes", "sublimation", "(subl.)",
