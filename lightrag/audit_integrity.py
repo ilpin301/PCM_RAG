@@ -88,10 +88,53 @@ def _signed(s):
     return out
 
 
+_PCT = {"": "%", "wt": "wt%", "mass": "wt%", "vol": "vol%", "mol": "mol%"}
+
+
+def _canon(fam, u):
+    """Canonical unit of a matched spelling. Per-mass J/g = kJ/kg (same number, not a conversion), but kJ/g,
+    J/kg, K vs °C vs °F, nm vs µm vs mm, MPa vs GPa, g/cm3 vs kg/m3, h vs min vs s all stay distinct."""
+    u = re.sub(r"[\s·.()]", "", u)
+    if fam == "cp":
+        m = re.match(r"(k?)J.*?(k?)g", u)
+        return {0: "J/(g·K)", 1: "kJ/(g·K)", -1: "J/(kg·K)"}[(m.group(1) == "k") - (m.group(2) == "k")]
+    if fam == "cond":
+        return "W/(m·K)"
+    if fam == "latent":
+        return "J/g"
+    if fam == "dens":
+        return "kg/m3" if u.startswith("kg") else "g/cm3"
+    if fam == "flux":
+        return "W/m2"
+    if fam == "press":
+        return u[0] + "Pa"
+    if fam == "length":
+        return "um" if u[0] in "µμ" else u
+    if fam == "time":
+        return {"h": "h", "m": "min", "s": "s"}[u[0]]
+    if fam == "pct":
+        return _PCT[u.rstrip("%")]
+    if fam == "temp":
+        return "°F" if u.endswith("F") else "K" if u == "K" else "°C"
+    return u  # molar: kJ/mol
+
+
 def unit_pairs(text):
-    """{(unit family, normalised signed number)}; every number of a range / +- chain counts."""
+    """{(canonical unit, normalised signed number)}; every number of a range / +- chain counts."""
     t = _prep(text)
-    return {(m.lastgroup, n) for m in UNIT_NUM_RE.finditer(t) for n in _signed(m.group("n"))}
+    return {(_canon(m.lastgroup, m.group(m.lastgroup)), n) for m in UNIT_NUM_RE.finditer(t)
+            for n in _signed(m.group("n"))}
+
+
+def _pct_wild(pairs):
+    """A bare '%' is unspecified: it supports wt% / vol% / mol% claims and vice versa."""
+    out = set(pairs)
+    for u, n in pairs:
+        if u == "%":
+            out.update((p, n) for p in ("wt%", "vol%", "mol%"))
+        elif u in ("wt%", "vol%", "mol%"):
+            out.add(("%", n))
+    return out
 
 
 def unit_numbers(text):
@@ -105,20 +148,24 @@ def all_numbers(text):
 
 # a unit named in a table header / caption without a number: bracketed, after a comma / slash / "in", or the
 # whole cell; degree and % symbols count anywhere in a header cell (not in a caption)
-_HDR_RE = {f: re.compile(rf"(?:^|[(\[,/]|\bin\s)\s*(?:{rx})\s*(?:[)\]]|$)") for f, rx in UNIT_FAMILIES.items()}
+_HDR_RE = {f: re.compile(rf"(?:^|[(\[,/]|\bin\s)\s*(?P<u>{rx})\s*(?:[)\]]|$)") for f, rx in UNIT_FAMILIES.items()}
 _HDR_SYM = {"temp": re.compile(r"[°º˚◦∘℃]|\\circ"), "pct": re.compile(r"%")}
-
-
-_HDR_BR = {f: re.compile(rf"[(\[]\s*(?:{rx})\s*[)\]]") for f, rx in UNIT_FAMILIES.items()}  # row labels: bracketed only
+_HDR_BR = {f: re.compile(rf"[(\[]\s*(?P<u>{rx})\s*[)\]]") for f, rx in UNIT_FAMILIES.items()}  # row labels: bracketed only
 # column headers that hold labels / counters, never a quantity: neither caption nor row-label units apply to them
 _NONUNIT_HDR = re.compile(r"(?:year|no|nr|num|number|sample|id|index|ref|reference|run|page|name|label|code|#)\.?:?", re.I)
 
 
-def _hdr_fams(s, loose=True, bracket=False):
+def _hdr_units(s, loose=True, bracket=False):
+    """Canonical units a header / caption / row label names (families only decide where to look)."""
     s = re.sub(r"<[^>]+>", "", s or "").strip()
-    if bracket:
-        return {f for f, rx in _HDR_BR.items() if rx.search(s)}
-    return {f for f, rx in _HDR_RE.items() if rx.search(s) or (loose and f in _HDR_SYM and _HDR_SYM[f].search(s))}
+    out = set()
+    for f, rx in (_HDR_BR if bracket else _HDR_RE).items():
+        m = rx.search(s)
+        if m:
+            out.add(_canon(f, m.group("u")))
+        elif loose and not bracket and f in _HDR_SYM and _HDR_SYM[f].search(s):
+            out.add(("°F" if re.search(r"(?:[°º˚◦∘]|\\circ)\s*\}?\s*F", s) else "°C") if f == "temp" else "%")
+    return out
 
 
 def _tables(t):
@@ -151,15 +198,15 @@ def table_pairs(text):
     caption names that unit family, in that order of precedence."""
     res = set()
     for cap, rows in _tables(_prep(text)):
-        capf, ncol = _hdr_fams(cap, loose=False), max((len(r) for r in rows), default=0)
-        colf = [set().union(*(_hdr_fams(r[i]) for r in rows[:2] if i < len(r))) for i in range(ncol)]
+        capf, ncol = _hdr_units(cap, loose=False), max((len(r) for r in rows), default=0)
+        colf = [set().union(*(_hdr_units(r[i]) for r in rows[:2] if i < len(r))) for i in range(ncol)]
         nonunit = [any(i < len(r) and _NONUNIT_HDR.fullmatch(re.sub(r"<[^>]+>", "", r[i]).strip()) for r in rows[:2])
                    for i in range(ncol)]
         for r in rows:
-            rowf = _hdr_fams(r[0], bracket=True) if r else set()
+            rowf = _hdr_units(r[0], bracket=True) if r else set()
             for i, c in enumerate(r):
-                for f in colf[i] or (set() if nonunit[i] else (rowf if i else set()) or capf):
-                    res.update((f, n) for n in _signed(c))
+                for u in colf[i] or (set() if nonunit[i] else (rowf if i else set()) or capf):
+                    res.update((u, n) for n in _signed(c))
     return res
 
 
@@ -219,9 +266,9 @@ def orphans(graph, chunks, doc_files):
 
 
 def grounding(graph, chunks):
-    """Items whose description (blocks removed) has (unit family, signed number) pairs absent from their source
-    chunks. A pair is supported only by the same number WITH a same-family unit (sign preserved) or as a bare
-    number in a table cell whose header / caption names that family. missing = the unsupported numbers;
+    """Items whose description (blocks removed) has (canonical unit, signed number) pairs absent from their source
+    chunks. A pair is supported only by the same number WITH the same canonical unit (sign preserved; a converted
+    value is not accepted) or as a bare number in a table cell whose header / caption names that unit. missing = the unsupported numbers;
     bare_only = the subset still present in the chunks as a bare number elsewhere (page / figure / reference /
     year or another unit - reviewer hint only, still missing)."""
     res = []
@@ -232,7 +279,7 @@ def grounding(graph, chunks):
             continue
         ids = source_ids(a)
         text = "\n".join(chunks[c]["content"] for c in ids if c in chunks)
-        missing = sorted({n for _, n in pairs - unit_pairs(text) - table_pairs(text)})
+        missing = sorted({n for _, n in pairs - _pct_wild(unit_pairs(text) | table_pairs(text))})
         if missing:
             bare = all_numbers(text)
             res.append({"kind": kind, "key": key, "entity_type": a.get("entity_type", ""),
@@ -274,15 +321,15 @@ def _selftest():
                     "1 hr, 2 hrs, 3 hour, 4 sec, 5 seconds, 6 second": {"1.0", "2.0", "3.0", "4.0", "5.0", "6.0"},
                     "5 s": set(), "5 items": set(), "12 cycles": set()}.items():
         assert unit_numbers(t) == want, (t, unit_numbers(t))
-    assert unit_pairs("200 J g-1 and 58 ℃") == {("latent", "200.0"), ("temp", "58.0")}
-    assert unit_pairs("180 kJ kg-1 K-1; 0.2 W/(m·K); 1.5 g/cm3") == {("cp", "180.0"), ("cond", "0.2"),
-                                                                    ("dens", "1.5")}
+    assert unit_pairs("200 J g-1 and 58 ℃") == {("J/g", "200.0"), ("°C", "58.0")}
+    assert unit_pairs("180 kJ kg-1 K-1; 0.2 W/(m·K); 1.5 g/cm3") == {("J/(g·K)", "180.0"), ("W/(m·K)", "0.2"),
+                                                                    ("g/cm3", "1.5")}
     one = lambda chunk, desc: grounding([("node", "N", {"description": desc, "source_id": "c", "file_path": "a"})],
                                         {"c": {"content": chunk}})
     r = one("See page 210 and Fig. 3.", "latent heat 210 kJ/kg")
     assert [(x["missing"], x["bare_only"]) for x in r] == [(["210.0"], ["210.0"])], r
     assert not one("latent heat 210 kJ/kg", "latent heat 210 kJ/kg")
-    assert not one("melts at 58.2 K", "melts at 58.2 °C")
+    assert [x["missing"] for x in one("melts at 58.2 K", "melts at 58.2 °C")] == [["58.2"]]  # canonical units, not families
     assert [x["missing"] for x in one("58.2 %", "58.2 °C")] == [["58.2"]]
     # F2: a bare number elsewhere in the chunk never grounds a unit claim
     assert [(x["missing"], x["bare_only"]) for x in one("ref 273 and Smith 2015, 12.5 mm", "melts at 12.5 °C")] \
@@ -311,7 +358,7 @@ def _selftest():
     # stage 1a: comma = thousands (1-3 digits, then groups of exactly 3), decimal (1-2 digits after), or list
     assert unit_numbers("1,500 kJ/kg") == {"1500.0"} and unit_numbers("2,446 °C") == {"2446.0"}
     assert unit_numbers("1,5 kJ/kg") == {"1.5"} and unit_numbers("0,5 g/cm3") == {"0.5"}
-    assert unit_pairs("5,10,15 wt%") == {("pct", "5.0"), ("pct", "10.0"), ("pct", "15.0")}, unit_pairs("5,10,15 wt%")
+    assert unit_pairs("5,10,15 wt%") == {("wt%", "5.0"), ("wt%", "10.0"), ("wt%", "15.0")}, unit_pairs("5,10,15 wt%")
     assert all_numbers("1,500 and 5,10,15") == {"1500.0", "5.0", "10.0", "15.0"}
     assert not one("rho 1,500 kJ/kg", "1500 kJ/kg") and not one("5,10,15 wt%", "10 wt%")
     # stage 1b: row-label '%' no longer makes a row of percentages; caption skipped for Year / No. / ID columns
@@ -329,6 +376,28 @@ def _selftest():
     assert unit_numbers("between 20 and 25 °C") == {"20.0", "25.0"}
     assert unit_numbers("Between 5 and 10 wt%") == {"5.0", "10.0"} and unit_numbers("20 and 25 °C") == {"25.0"}
     assert not one("20-25 °C", "between 20 and 25 °C")
+    # stage 2: (canonical unit, value) - same value under a different unit of the same family stays missing
+    for src, claim in [("58 K", "58 °C"), ("58 °C", "58 K"), ("58 °F", "58 °C"), ("58 °C", "58 °F"),
+                       ("5 nm", "5 µm"), ("5 µm", "5 mm"), ("5 mm", "5 nm"), ("5 cm", "5 mm"),
+                       ("1.2 g/cm3", "1.2 kg/m3"), ("1200 kg/m3", "1200 g/cm3"),
+                       ("2.1 J/(g·K)", "2.1 kJ/(g·K)"), ("2.1 kJ/(kg·K)", "2.1 J/(kg·K)"),
+                       ("5 MPa", "5 GPa"), ("5 GPa", "5 kPa"), ("5 kPa", "5 MPa"),
+                       ("5 h", "5 min"), ("5 min", "5 s"), ("5 s", "5 h"), ("5 hours", "5 seconds"),
+                       ("5 wt%", "5 vol%"), ("5 mol%", "5 wt%")]:
+        if src.endswith(" s"):
+            src = src[:-2] + " sec"
+        if claim.endswith(" s"):
+            claim = claim[:-2] + " sec"
+        assert [x["missing"] for x in one(f"value {src}", f"value {claim}")] == [[_norm(claim.split()[0])]], (src, claim)
+    for src, claim in [("58 °C", "58 ℃"), ("58 K", "58 K"), ("5 µm", "5 μm"), ("1.2 g/cm3", "1.2 g/cm³"),
+                       ("1200 kg/m3", "1200 kg m-3"), ("2.1 kJ/(kg·K)", "2.1 J/(g·K)"), ("200 kJ/kg", "200 J g-1"),
+                       ("5 MPa", "5 MPa"), ("5 hours", "5 h"), ("30 minutes", "30 min"), ("5 seconds", "5 sec"),
+                       ("5 wt%", "5 mass%"), ("5 %", "5 wt%"), ("5 vol%", "5 %"), ("58 ° C", "58 °C")]:
+        assert not one(f"value {src}", f"value {claim}"), (src, claim)
+    assert not one(tb("T (K)", "58.2"), "58.2 K") and [x["missing"] for x in one(tb("T (K)", "58.2"), "58.2 °C")] == [["58.2"]]
+    assert not one(tb("T (°C)", "58.2"), "58.2 °C") and [x["missing"] for x in one(tb("T (°C)", "58.2"), "58.2 K")] == [["58.2"]]
+    assert not one(tb("d (µm)", "5"), "5 µm") and [x["missing"] for x in one(tb("d (µm)", "5"), "5 nm")] == [["5.0"]]
+    assert not one("Table 1 (MPa)\n\n<table><tr><td>A</td><td>B</td></tr><tr><td>7</td></tr></table>", "7 MPa")
     # stage 1d: un-audited number+unit detector (units no family covers); noise like "1 J." is tolerated
     for t, want in {"10 mPa·s": ["mPa·s"], "3.3 V": ["V"], "2 m/s": ["m/s"], "100 kWh/m3": ["kWh/m3"],
                     "50 MJ/m³": ["MJ/m³"], "1.2 eV": ["eV"], "10 kΩ": ["kΩ"], "5 ns and 20 µs": ["ns", "µs"],
