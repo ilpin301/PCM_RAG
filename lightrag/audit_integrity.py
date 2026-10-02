@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,7 +20,11 @@ OUT = SCRIPT_DIR / "data" / "audit"
 NS = "{http://graphml.graphdrawing.org/xmlns}"
 SEP = "<SEP>"
 BLOCK_RE = re.compile(r"<!--(PUBCHEM|OPENALEX)_START-->.*?<!--\1_END-->", re.DOTALL)
-NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
+# comma rule (as the melting-point parser in enrich_pubchem.py): thousands separator = 1-3 digits then groups of
+# exactly 3; decimal comma = 1-2 digits after it (or 0,xxx), only when no further comma-digit follows and the number
+# does not itself follow a comma ("5,10,15" is a list); anything else is a plain number
+_NUM = (r"(?:[1-9]\d{0,2}(?:,\d{3})+(?!\d)(?:\.\d+)?|(?<![,\d])(?:0,\d+|\d+,\d{1,2})(?![\d,])|\d+(?:\.\d+)?)")
+NUM_RE = re.compile(_NUM)
 _S, _M1, _M3 = r"[\s·.]?", r"(?:\^?-1|⁻¹)", r"(?:\^?-3|⁻³)"
 # family -> unit regex; order = priority (cp before latent, cond before flux), first match wins
 UNIT_FAMILIES = {
@@ -36,16 +41,16 @@ UNIT_FAMILIES = {
     # degree sign variants (º ˚ ◦ ∘, U+F0B0 symbol font), LaTeX ^{\circ}C, "degrees C"
     "temp": r"[°º˚◦∘]\s?[CF]|(?:\{\s*\}\s*)?\^?\s*\{?\s*\\circ\s*\}?\s*[CF]|deg(?:rees?)?\s?C|℃|K",
 }
-_NUM = r"\d+(?:[.,]\d+)?"
 # one number, or a range / +- chain of numbers, then a unit; pct may abut text ("5 wt%Al"), others may not
 UNIT_NUM_RE = re.compile(
-    rf"(?<![\w.])(?P<n>-?{_NUM}(?:(?:\s*(?:[-–—±]|\+/?-)\s*|\s+to\s+)-?{_NUM})*)\s*(?:"
+    rf"(?<![\w.])(?P<btw>(?i:between)\s+)?(?P<n>-?{_NUM}"
+    rf"(?:(?:\s*(?:[-–—±]|\+/?-)\s*|\s+to\s+|,|(?(btw)\s+and\s+|(?!)))-?{_NUM})*)\s*(?:"
     + "|".join(f"(?P<{f}>(?:{rx})" + ("" if f == "pct" else "(?![A-Za-z])") + ")"
                for f, rx in UNIT_FAMILIES.items()) + ")")
 
 
 def _norm(x):
-    return str(float(x.replace(",", ".")))
+    return str(float(x.replace(",", "") if re.fullmatch(r"[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?", x) else x.replace(",", ".")))
 
 
 SUP_RE = re.compile(r"<sup>\s*([-−+]?\d+)\s*</sup>", re.I)
@@ -104,8 +109,15 @@ _HDR_RE = {f: re.compile(rf"(?:^|[(\[,/]|\bin\s)\s*(?:{rx})\s*(?:[)\]]|$)") for 
 _HDR_SYM = {"temp": re.compile(r"[°º˚◦∘℃]|\\circ"), "pct": re.compile(r"%")}
 
 
-def _hdr_fams(s, loose=True):
+_HDR_BR = {f: re.compile(rf"[(\[]\s*(?:{rx})\s*[)\]]") for f, rx in UNIT_FAMILIES.items()}  # row labels: bracketed only
+# column headers that hold labels / counters, never a quantity: neither caption nor row-label units apply to them
+_NONUNIT_HDR = re.compile(r"(?:year|no|nr|num|number|sample|id|index|ref|reference|run|page|name|label|code|#)\.?:?", re.I)
+
+
+def _hdr_fams(s, loose=True, bracket=False):
     s = re.sub(r"<[^>]+>", "", s or "").strip()
+    if bracket:
+        return {f for f, rx in _HDR_BR.items() if rx.search(s)}
     return {f for f, rx in _HDR_RE.items() if rx.search(s) or (loose and f in _HDR_SYM and _HDR_SYM[f].search(s))}
 
 
@@ -141,12 +153,40 @@ def table_pairs(text):
     for cap, rows in _tables(_prep(text)):
         capf, ncol = _hdr_fams(cap, loose=False), max((len(r) for r in rows), default=0)
         colf = [set().union(*(_hdr_fams(r[i]) for r in rows[:2] if i < len(r))) for i in range(ncol)]
+        nonunit = [any(i < len(r) and _NONUNIT_HDR.fullmatch(re.sub(r"<[^>]+>", "", r[i]).strip()) for r in rows[:2])
+                   for i in range(ncol)]
         for r in rows:
-            rowf = _hdr_fams(r[0]) if r else set()
+            rowf = _hdr_fams(r[0], bracket=True) if r else set()
             for i, c in enumerate(r):
-                for f in colf[i] or (rowf if i else set()) or capf:
+                for f in colf[i] or (set() if nonunit[i] else (rowf if i else set()) or capf):
                     res.update((f, n) for n in _signed(c))
     return res
+
+
+# physical units NO family covers (informational count only; these descriptions are not audited yet). Composite
+# units first. Known noise: a lone "J" / "A" style initial after a number ("1 J.") is counted.
+_UNAUD = "|".join([
+    r"k?J/\(?kg[·.\s-]?°?[CK]\)?", r"k?W/\(?m[2²]?[·.\s-]?°?[CK]\)?", r"m?Pa[·.\s]s", r"[kM]?Wh/m[3³]", r"[kM]J/m[3³]",
+    r"[kM]?J/kg", r"m/s", r"[kM]?Wh", r"[mkM]?W", r"[kMG]?Hz", r"[mkM]?V", r"[kM]?(?:Ω|ohm)", r"[mkM]?eV",
+    r"[nµμpm]s", r"k?J", r"Pa", r"mbar|bar|atm|psi", r"mol", r"[mµμ]?g", r"[mµ]?L", r"ppm|rpm", r"m[2²3³]"])
+UNAUD_RE = re.compile(rf"(?<![\w.])-?{_NUM}\s?(?P<u>{_UNAUD})(?![A-Za-z/²³(])")
+
+
+def unaudited_tokens(text):
+    """Units of <number><unit> tokens that no family covers (tokens inside a UNIT_NUM_RE match are skipped)."""
+    t = _prep(text)
+    spans = [m.span() for m in UNIT_NUM_RE.finditer(t)]
+    return [m.group("u") for m in UNAUD_RE.finditer(t) if not any(a <= m.start() < b for a, b in spans)]
+
+
+def unaudited_count(graph):
+    """(tokens, items with tokens, Counter of units) over every graph description, blocks stripped."""
+    c, items = Counter(), 0
+    for _, _, a in graph:
+        u = unaudited_tokens(BLOCK_RE.sub("", a.get("description") or ""))
+        items += bool(u)
+        c.update(u)
+    return sum(c.values()), items, c
 
 
 def load_graph(path=GRAPHML):
@@ -268,6 +308,36 @@ def _selftest():
     assert [x["missing"] for x in one("| T (°C) | Page |\n|---|---|\n| 40 | 58.2 |", "58.2 °C")] == [["58.2"]]
     assert not one("Table 2. Melting points (°C)\n\n<table><tr><td>A</td><td>B</td></tr><tr><td>58.2</td></tr></table>", "58.2 °C")
     assert not one("<table><tr><td>T (°C)</td><td>50</td><td>58.2</td></tr><tr><td>x</td><td>1</td><td>2</td></tr></table>", "58.2 °C")
+    # stage 1a: comma = thousands (1-3 digits, then groups of exactly 3), decimal (1-2 digits after), or list
+    assert unit_numbers("1,500 kJ/kg") == {"1500.0"} and unit_numbers("2,446 °C") == {"2446.0"}
+    assert unit_numbers("1,5 kJ/kg") == {"1.5"} and unit_numbers("0,5 g/cm3") == {"0.5"}
+    assert unit_pairs("5,10,15 wt%") == {("pct", "5.0"), ("pct", "10.0"), ("pct", "15.0")}, unit_pairs("5,10,15 wt%")
+    assert all_numbers("1,500 and 5,10,15") == {"1500.0", "5.0", "10.0", "15.0"}
+    assert not one("rho 1,500 kJ/kg", "1500 kJ/kg") and not one("5,10,15 wt%", "10 wt%")
+    # stage 1b: row-label '%' no longer makes a row of percentages; caption skipped for Year / No. / ID columns
+    t1 = "<table><tr><td>Sample</td><td>Value</td></tr><tr><td>PCM-5%</td><td>58.2</td></tr></table>"
+    assert [x["missing"] for x in one(t1, "58.2 %")] == [["58.2"]]
+    t2 = "<table><tr><td>Sample</td><td>Value</td></tr><tr><td>Tm (°C)</td><td>58.2</td></tr></table>"
+    assert not one(t2, "58.2 °C")
+    t3 = "Table 1. Properties (°C)\n\n<table><tr><td>Year</td><td>T</td></tr><tr><td>2015</td><td>58</td></tr></table>"
+    assert [x["missing"] for x in one(t3, "2015 °C")] == [["2015.0"]] and not one(t3, "58 °C")
+    t4 = "Results (°C)\n| No. | Value |\n|---|---|\n| 3 | 2 |"
+    assert [x["missing"] for x in one(t4, "3 °C")] == [["3.0"]] and not one(t4, "2 °C")
+    for h in ("ID", "#", "Sample", "Year"):
+        assert [x["missing"] for x in one(f"Results (°C)\n| {h} | Value |\n|---|---|\n| 7 | 2 |", "7 °C")] == [["7.0"]], h
+    # stage 1c: "between A and B unit" chains like "A to B unit"
+    assert unit_numbers("between 20 and 25 °C") == {"20.0", "25.0"}
+    assert unit_numbers("Between 5 and 10 wt%") == {"5.0", "10.0"} and unit_numbers("20 and 25 °C") == {"25.0"}
+    assert not one("20-25 °C", "between 20 and 25 °C")
+    # stage 1d: un-audited number+unit detector (units no family covers); noise like "1 J." is tolerated
+    for t, want in {"10 mPa·s": ["mPa·s"], "3.3 V": ["V"], "2 m/s": ["m/s"], "100 kWh/m3": ["kWh/m3"],
+                    "50 MJ/m³": ["MJ/m³"], "1.2 eV": ["eV"], "10 kΩ": ["kΩ"], "5 ns and 20 µs": ["ns", "µs"],
+                    "0.5 W/m-K": ["W/m-K"], "1.5 kJ/(kg·°C)": ["kJ/(kg·°C)"], "0.9 W/(m²·K)": ["W/(m²·K)"],
+                    "0.2 W/m²K": ["W/m²K"], "0.7 W/(m·°C)": ["W/(m·°C)"], "5 mW": ["mW"], "2 J/kg": ["J/kg"],
+                    "1 J.": ["J"],
+                    "12 cycles": [], "3 wt%": [], "58 °C": [], "0.2 W/mK": [], "200 kJ/kg": [], "Fig 3": [],
+                    "10 K/min": [], "5 nm": [], "2 Vickers": []}.items():
+        assert unaudited_tokens(t) == want, (t, unaudited_tokens(t))
     print("selftest OK")
 
 
@@ -276,6 +346,7 @@ def main(argv):
         return _selftest()
     if argv[1:] not in (["orphans"], ["grounding"]):
         sys.exit(__doc__)
+    sys.stdout.reconfigure(errors="replace")  # cp1251 console cannot print Ω / µ
     chunks = json.loads((STORE / "kv_store_text_chunks.json").read_text(encoding="utf-8"))
     graph = load_graph()
     OUT.mkdir(parents=True, exist_ok=True)
@@ -287,6 +358,10 @@ def main(argv):
     (OUT / f"{argv[1]}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     kinds = {k: sum(1 for x in res if x["kind"] == k) for k in ("node", "edge")}
     print(f"{argv[1]}: {kinds} -> {OUT / (argv[1] + '.json')}")
+    if argv[1] == "grounding":
+        n, m, c = unaudited_count(graph)
+        print(f"un-audited number+unit tokens: {n} in {m} items (top units: "
+              + ", ".join(f"{u}={k}" for u, k in c.most_common(10)) + ")")
     if argv[1] == "orphans":
         print("NOT deleted_doc_only (report, never delete):", sum(1 for x in res if not x["deleted_doc_only"]))
 
