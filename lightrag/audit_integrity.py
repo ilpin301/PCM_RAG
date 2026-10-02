@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import xml.etree.ElementTree as ET
+from decimal import Decimal
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
@@ -47,19 +48,105 @@ def _norm(x):
     return str(float(x.replace(",", ".")))
 
 
-def unit_pairs(text):
-    """{(unit family, normalised unsigned number)}; every number of a range / +- chain counts."""
+SUP_RE = re.compile(r"<sup>\s*([-−+]?\d+)\s*</sup>", re.I)
+SPACED_RE = re.compile(r"(?<![\w.])\d(?: [\d.])+(?<=\d)(?= ?[°º˚◦∘℃^{%\\A-Za-zµμ])")  # "3 9 . 1 8 °C", "1 8 ^ {..
+_SCI = r"(\d+(?:[.,]\d+)?)\s*(?:[×x·*]|\\times)\s*10\s*\^\s*\{?\s*([-+]?\d+)\s*\}?"
+SCI_RE = re.compile(rf"(?<![\w.]){_SCI}|(?<![\w.])(\d+(?:\.\d+)?)[eE]([-+]?\d+)(?=\s*[A-Za-z%°])")
+
+
+def _sci(m):
+    a, b = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+    return format(Decimal(f"{a.replace(',', '.')}E{b}"), "f") if abs(int(b)) <= 30 else m.group(0)
+
+
+def _prep(text):
+    """Normalise OCR / markup variants so unit patterns see plain text: unicode minus and a leading en/em dash
+    become '-', HTML <sup>n</sup> -> ^n, LaTeX-spaced digits are closed up, a x 10^b / aEb become decimals."""
     t = (text or "").replace("−", "-")
-    return {(m.lastgroup, _norm(n)) for m in UNIT_NUM_RE.finditer(t) for n in NUM_RE.findall(m.group("n"))}
+    t = re.sub(r"(?<![\w.])[–—](?=\d)", "-", t)
+    t = SUP_RE.sub(lambda m: "^" + m.group(1).replace("−", "-"), t)
+    t = SPACED_RE.sub(lambda m: m.group().replace(" ", ""), t)
+    return SCI_RE.sub(_sci, t)
+
+
+def _signed(s):
+    """Normalised numbers of s, '-' kept for a sign (a hyphen glued to a preceding word/digit or following a
+    digit is a range / label, not a minus)."""
+    out = []
+    for m in NUM_RE.finditer(s):
+        pre, neg = s[:m.start()], False
+        if pre.endswith("-"):
+            p = pre[:-1]
+            neg = not p or (not re.search(r"[\w/+.]$", p) and not p.rstrip()[-1:].isdigit())
+        n = _norm(m.group())
+        out.append("-" + n if neg and float(n) else n)
+    return out
+
+
+def unit_pairs(text):
+    """{(unit family, normalised signed number)}; every number of a range / +- chain counts."""
+    t = _prep(text)
+    return {(m.lastgroup, n) for m in UNIT_NUM_RE.finditer(t) for n in _signed(m.group("n"))}
 
 
 def unit_numbers(text):
     """Normalised values of numbers followed by a unit (sign dropped)."""
-    return {n for _, n in unit_pairs(text)}
+    return {n.lstrip("-") for _, n in unit_pairs(text)}
 
 
 def all_numbers(text):
     return {_norm(x) for x in NUM_RE.findall(text or "")}
+
+
+# a unit named in a table header / caption without a number: bracketed, after a comma / slash / "in", or the
+# whole cell; degree and % symbols count anywhere in a header cell (not in a caption)
+_HDR_RE = {f: re.compile(rf"(?:^|[(\[,/]|\bin\s)\s*(?:{rx})\s*(?:[)\]]|$)") for f, rx in UNIT_FAMILIES.items()}
+_HDR_SYM = {"temp": re.compile(r"[°º˚◦∘℃]|\\circ"), "pct": re.compile(r"%")}
+
+
+def _hdr_fams(s, loose=True):
+    s = re.sub(r"<[^>]+>", "", s or "").strip()
+    return {f for f, rx in _HDR_RE.items() if rx.search(s) or (loose and f in _HDR_SYM and _HDR_SYM[f].search(s))}
+
+
+def _tables(t):
+    """[(caption, rows)] for HTML <table>s and markdown pipe tables; rows = lists of tag-free cell strings."""
+    out = []
+    for m in re.finditer(r"<table\b.*?</table>", t, re.S | re.I):
+        rows = [[re.sub(r"<[^>]+>", "", c) for c in re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", r, re.S | re.I)]
+                for r in re.findall(r"<tr\b.*?</tr>", m.group(), re.S | re.I)]
+        cap = re.findall(r"<caption\b[^>]*>(.*?)</caption>", m.group(), re.S | re.I)
+        pre = [ln for ln in t[max(0, m.start() - 300):m.start()].splitlines() if ln.strip()]
+        out.append((" ".join(cap + pre[-1:]), rows))
+    lines, i = t.splitlines(), 0
+    while i < len(lines):
+        if lines[i].count("|") < 2:
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and lines[j].count("|") >= 2:
+            j += 1
+        rows = [[c.strip() for c in ln.strip().strip("|").split("|")] for ln in lines[i:j]]
+        rows = [r for r in rows if not all(re.fullmatch(r":?-{2,}:?", c) for c in r)]
+        pre = [ln for ln in lines[:i] if ln.strip()]
+        out.append((pre[-1] if pre else "", rows))
+        i = j
+    return out
+
+
+def table_pairs(text):
+    """(unit family, number) for bare numbers in table cells whose column header, row header (first cell) or
+    caption names that unit family, in that order of precedence."""
+    res = set()
+    for cap, rows in _tables(_prep(text)):
+        capf, ncol = _hdr_fams(cap, loose=False), max((len(r) for r in rows), default=0)
+        colf = [set().union(*(_hdr_fams(r[i]) for r in rows[:2] if i < len(r))) for i in range(ncol)]
+        for r in rows:
+            rowf = _hdr_fams(r[0]) if r else set()
+            for i, c in enumerate(r):
+                for f in colf[i] or (rowf if i else set()) or capf:
+                    res.update((f, n) for n in _signed(c))
+    return res
 
 
 def load_graph(path=GRAPHML):
@@ -92,9 +179,11 @@ def orphans(graph, chunks, doc_files):
 
 
 def grounding(graph, chunks):
-    """Items whose description (blocks removed) has (unit family, number) pairs absent from their source
-    chunks. missing = those numbers; bare_only = the subset still present in the chunks as a bare number
-    (page/figure number or another unit - reviewer hint)."""
+    """Items whose description (blocks removed) has (unit family, signed number) pairs absent from their source
+    chunks. A pair is supported only by the same number WITH a same-family unit (sign preserved) or as a bare
+    number in a table cell whose header / caption names that family. missing = the unsupported numbers;
+    bare_only = the subset still present in the chunks as a bare number elsewhere (page / figure / reference /
+    year or another unit - reviewer hint only, still missing)."""
     res = []
     for kind, key, a in graph:
         desc = BLOCK_RE.sub("", a.get("description") or "")
@@ -103,12 +192,11 @@ def grounding(graph, chunks):
             continue
         ids = source_ids(a)
         text = "\n".join(chunks[c]["content"] for c in ids if c in chunks)
-        # sign is ignored (unit_pairs drops it); a pair counts as supported only with the same family
-        missing = sorted({n for _, n in pairs - unit_pairs(text)})
+        missing = sorted({n for _, n in pairs - unit_pairs(text) - table_pairs(text)})
         if missing:
             bare = all_numbers(text)
             res.append({"kind": kind, "key": key, "entity_type": a.get("entity_type", ""),
-                        "missing": missing, "bare_only": [n for n in missing if n in bare],
+                        "missing": missing, "bare_only": [n for n in missing if n.lstrip("-") in bare],
                         "description": desc, "files": files(a),
                         "chunk_ids": ids, "dangling_chunks": [c for c in ids if c not in chunks]})
     return res
@@ -156,6 +244,30 @@ def _selftest():
     assert not one("latent heat 210 kJ/kg", "latent heat 210 kJ/kg")
     assert not one("melts at 58.2 K", "melts at 58.2 °C")
     assert [x["missing"] for x in one("58.2 %", "58.2 °C")] == [["58.2"]]
+    # F2: a bare number elsewhere in the chunk never grounds a unit claim
+    assert [(x["missing"], x["bare_only"]) for x in one("ref 273 and Smith 2015, 12.5 mm", "melts at 12.5 °C")] \
+        == [(["12.5"], ["12.5"])]
+    # sign is preserved (en dash / unicode minus count as minus; range hyphen is not a sign)
+    assert [x["missing"] for x in one("-5 °C", "5 °C")] == [["5.0"]]
+    assert [x["missing"] for x in one("5 °C", "-5 °C")] == [["-5.0"]]
+    assert not one("−5 °C", "-5 °C") and not one("–5 °C", "-5 °C") and not one("20-25 °C", "25 °C")
+    assert not one("from -5 to -3 °C", "-3 °C")
+    # LaTeX-spaced digits, HTML <sup>, scientific notation
+    assert not one("avg 3 9 . 1 8 °C", "39.18 °C") and not one("1 8 ^ { \\circ } C", "18 °C")
+    assert not one("0.2 W m<sup>-1</sup> K<sup>-1</sup>", "0.2 W/(m·K)")
+    assert not one("1.2 × 10^{3} kg/m3", "1200 kg/m3") and not one("1.2 × 10<sup>-3</sup> W/m K", "0.0012 W/m K")
+    assert not one("k = 1.5e-1 W/mK", "0.15 W/m K")
+    # table cells: column / row header or caption carries the unit; a cell under another header does not
+    tb = lambda hdr, cell: f"<table><tr><td>{hdr}</td><td>Name</td></tr><tr><td>{cell}</td><td>PCM</td></tr></table>"
+    assert not one(tb("T (°C)", "58.2"), "melts at 58.2 °C")
+    assert not one(tb("T (K)", "58.2"), "58.2 K")
+    assert [x["missing"] for x in one(tb("T (°C)", "58.2"), "58.2 kJ/kg")] == [["58.2"]]
+    assert [x["bare_only"] for x in one(tb("Page", "58.2"), "58.2 °C")] == [["58.2"]]
+    assert not one(tb("&Delta;H (kJ/kg)", "210"), "210 kJ/kg")
+    assert not one("| Sample | T (°C) |\n|---|---|\n| A | 58.2 |", "58.2 °C")
+    assert [x["missing"] for x in one("| T (°C) | Page |\n|---|---|\n| 40 | 58.2 |", "58.2 °C")] == [["58.2"]]
+    assert not one("Table 2. Melting points (°C)\n\n<table><tr><td>A</td><td>B</td></tr><tr><td>58.2</td></tr></table>", "58.2 °C")
+    assert not one("<table><tr><td>T (°C)</td><td>50</td><td>58.2</td></tr><tr><td>x</td><td>1</td><td>2</td></tr></table>", "58.2 °C")
     print("selftest OK")
 
 
