@@ -18,19 +18,44 @@ OUT = SCRIPT_DIR / "data" / "audit"
 NS = "{http://graphml.graphdrawing.org/xmlns}"
 SEP = "<SEP>"
 BLOCK_RE = re.compile(r"<!--(PUBCHEM|OPENALEX)_START-->.*?<!--\1_END-->", re.DOTALL)
-UNIT_NUM_RE = re.compile(r"(?<![\w.])(-?\d+(?:[.,]\d+)?)\s*(?:°\s*C|K\b|kJ/kg|J/g|W/\(?m|g/cm|kg/m|%|"
-                         r"MPa|GPa|nm|µm|μm|mm|kJ/mol)")
 NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_S, _M1, _M3 = r"[\s·.]?", r"(?:\^?-1|⁻¹)", r"(?:\^?-3|⁻³)"
+# family -> unit regex; order = priority (cp before latent, cond before flux), first match wins
+UNIT_FAMILIES = {
+    "cp": rf"k?J/\(?k?g{_S}K\)?|k?J{_S}k?g{_M1}{_S}K{_M1}",
+    "cond": rf"W/\(?m{_S}K\)?|W{_S}m{_M1}{_S}K{_M1}",
+    "latent": rf"kJ/kg|J/g|kJ{_S}kg{_M1}|J{_S}g{_M1}",
+    "molar": r"kJ/mol",
+    "dens": rf"g/cm[3³]?|kg/m[3³]?|g{_S}cm{_M3}|kg{_S}m{_M3}",
+    "flux": r"W/m[2²]",
+    "press": r"[kMG]Pa",
+    "length": r"nm|[µμ]m|mm|cm",
+    "time": r"hours?|hrs?|h|minutes?|min|seconds?|sec",
+    "pct": r"(?:(?:wt|vol|mass|mol)\.?\s?)?%",
+    # degree sign variants (º ˚ ◦ ∘, U+F0B0 symbol font), LaTeX ^{\circ}C, "degrees C"
+    "temp": r"[°º˚◦∘]\s?[CF]|(?:\{\s*\}\s*)?\^?\s*\{?\s*\\circ\s*\}?\s*[CF]|deg(?:rees?)?\s?C|℃|K",
+}
+_NUM = r"\d+(?:[.,]\d+)?"
+# one number, or a range / +- chain of numbers, then a unit; pct may abut text ("5 wt%Al"), others may not
+UNIT_NUM_RE = re.compile(
+    rf"(?<![\w.])(?P<n>-?{_NUM}(?:(?:\s*(?:[-–—±]|\+/?-)\s*|\s+to\s+)-?{_NUM})*)\s*(?:"
+    + "|".join(f"(?P<{f}>(?:{rx})" + ("" if f == "pct" else "(?![A-Za-z])") + ")"
+               for f, rx in UNIT_FAMILIES.items()) + ")")
 
 
 def _norm(x):
     return str(float(x.replace(",", ".")))
 
 
+def unit_pairs(text):
+    """{(unit family, normalised unsigned number)}; every number of a range / +- chain counts."""
+    t = (text or "").replace("−", "-")
+    return {(m.lastgroup, _norm(n)) for m in UNIT_NUM_RE.finditer(t) for n in NUM_RE.findall(m.group("n"))}
+
+
 def unit_numbers(text):
     """Normalised values of numbers followed by a unit (sign dropped)."""
-    t = (text or "").replace("−", "-")
-    return {_norm(m.group(1).lstrip("-")) for m in UNIT_NUM_RE.finditer(t)}
+    return {n for _, n in unit_pairs(text)}
 
 
 def all_numbers(text):
@@ -67,18 +92,24 @@ def orphans(graph, chunks, doc_files):
 
 
 def grounding(graph, chunks):
-    """Items whose description (blocks removed) has unit-numbers absent from their source chunks."""
+    """Items whose description (blocks removed) has (unit family, number) pairs absent from their source
+    chunks. missing = those numbers; bare_only = the subset still present in the chunks as a bare number
+    (page/figure number or another unit - reviewer hint)."""
     res = []
     for kind, key, a in graph:
         desc = BLOCK_RE.sub("", a.get("description") or "")
-        nums = unit_numbers(desc)
-        if not nums:
+        pairs = unit_pairs(desc)
+        if not pairs:
             continue
         ids = source_ids(a)
-        missing = sorted(nums - all_numbers("\n".join(chunks[c]["content"] for c in ids if c in chunks)))
+        text = "\n".join(chunks[c]["content"] for c in ids if c in chunks)
+        # sign is ignored (unit_pairs drops it); a pair counts as supported only with the same family
+        missing = sorted({n for _, n in pairs - unit_pairs(text)})
         if missing:
+            bare = all_numbers(text)
             res.append({"kind": kind, "key": key, "entity_type": a.get("entity_type", ""),
-                        "missing": missing, "description": desc, "files": files(a),
+                        "missing": missing, "bare_only": [n for n in missing if n in bare],
+                        "description": desc, "files": files(a),
                         "chunk_ids": ids, "dangling_chunks": [c for c in ids if c not in chunks]})
     return res
 
@@ -97,6 +128,34 @@ def _selftest():
     assert [(x["key"], x["deleted_doc_only"]) for x in orph] == [("Old", True), ("Live", False)], orph
     assert unit_numbers("−5 °C, 1,5 %, 3 K and 12 cycles") == {"5.0", "1.5", "3.0"}
     assert unit_numbers(BLOCK_RE.sub("", "W. <!--PUBCHEM_START-->mp 0 °C<!--PUBCHEM_END-->")) == set()
+    for t, want in {"5 wt%": {"5.0"}, "12 vol %": {"12.0"}, "3.5 mass%": {"3.5"}, "2 mol%": {"2.0"},
+                    "4 wt.%": {"4.0"}, "20-25 °C": {"20.0", "25.0"}, "20–25 °C": {"20.0", "25.0"},
+                    "20 to 25 °C": {"20.0", "25.0"}, "20 °C to 25 °C": {"20.0", "25.0"},
+                    "5.2 ± 0.3 %": {"5.2", "0.3"}, "5 +- 1 K": {"5.0", "1.0"}, "5 +/- 1 K": {"5.0", "1.0"},
+                    "180 kJ kg-1": {"180.0"}, "180 kJ kg^-1": {"180.0"}, "180 kJ kg⁻¹": {"180.0"},
+                    "180 kJ·kg⁻¹": {"180.0"}, "200 J g-1": {"200.0"}, "0.2 W m-1 K-1": {"0.2"},
+                    "0.2 W m⁻¹ K⁻¹": {"0.2"}, "58 ℃": {"58.0"}, "2.1 J/(g·K)": {"2.1"},
+                    "2.1 J/(g.K)": {"2.1"}, "100 °F": {"100.0"}, "5 cm": {"5.0"}, "101 kPa": {"101.0"},
+                    "2 h": {"2.0"}, "30 min": {"30.0"}, "12 cycles": set(), "Fig. 3": set(),
+                    "page 210": set()}.items():
+        assert unit_numbers(t) == want, (t, unit_numbers(t))
+    for t, want in {"43 C": {"43.0"}, "25 ◦C": {"25.0"}, "25 ∘C": {"25.0"}, "25 º C": {"25.0"},
+                    "25 ˚F": {"25.0"}, "9^{\\circ}C": {"9.0"}, "9 ^ { \\circ } C": {"9.0"},
+                    "9 { }^{\\circ}C": {"9.0"}, "20 degrees C": {"20.0"}, "20 degree C": {"20.0"},
+                    "20 deg C": {"20.0"}, "35 minutes and 2 hours": {"35.0", "2.0"},
+                    "1 hr, 2 hrs, 3 hour, 4 sec, 5 seconds, 6 second": {"1.0", "2.0", "3.0", "4.0", "5.0", "6.0"},
+                    "5 s": set(), "5 items": set(), "12 cycles": set()}.items():
+        assert unit_numbers(t) == want, (t, unit_numbers(t))
+    assert unit_pairs("200 J g-1 and 58 ℃") == {("latent", "200.0"), ("temp", "58.0")}
+    assert unit_pairs("180 kJ kg-1 K-1; 0.2 W/(m·K); 1.5 g/cm3") == {("cp", "180.0"), ("cond", "0.2"),
+                                                                    ("dens", "1.5")}
+    one = lambda chunk, desc: grounding([("node", "N", {"description": desc, "source_id": "c", "file_path": "a"})],
+                                        {"c": {"content": chunk}})
+    r = one("See page 210 and Fig. 3.", "latent heat 210 kJ/kg")
+    assert [(x["missing"], x["bare_only"]) for x in r] == [(["210.0"], ["210.0"])], r
+    assert not one("latent heat 210 kJ/kg", "latent heat 210 kJ/kg")
+    assert not one("melts at 58.2 K", "melts at 58.2 °C")
+    assert [x["missing"] for x in one("58.2 %", "58.2 °C")] == [["58.2"]]
     print("selftest OK")
 
 

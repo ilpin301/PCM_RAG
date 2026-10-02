@@ -69,7 +69,7 @@ CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
 VERIFY_FILE = "verify.json"  # under CACHE_DIR; GLM same-substance verdicts per (name, CID)
-FACTS_VERSION = 4  # 4: mp only from value-first strings / numbers; disagreeing values -> range
+FACTS_VERSION = 4  # 4: mp only from value-first strings / numbers; no majority of agreeing values -> not available
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
 def _load_lightrag_key():
@@ -103,7 +103,7 @@ MARK_START = "<!--PUBCHEM_START-->"
 MARK_END = "<!--PUBCHEM_END-->"
 BLOCK_RE = re.compile(r"<!--PUBCHEM_START-->.*?<!--PUBCHEM_END-->", re.DOTALL)
 OPENALEX_BLOCK_RE = re.compile(r"<!--OPENALEX_START-->.*?<!--OPENALEX_END-->", re.DOTALL)
-LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID\s*\d+", re.IGNORECASE)  # enrichment facts outside a block
+LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID[:#]?\s*\d+|\bSMILES\b|\bIUPAC\b|\bMW\s*\d+(?:[.,]\d+)?\s*g/mol", re.IGNORECASE)  # enrichment facts outside a block, incl. paraphrase
 
 
 def _leak_text(desc):
@@ -592,7 +592,8 @@ MP_VALUE_RE = re.compile(
     r"(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*(?:(?:-|to|–)\s*-?[\d,]+(?:\.\d+)?\s*)?(?:°\s*|deg\s*)?([CFK])\b",
     re.IGNORECASE,
 )
-MP_AGREE_C = 5.0  # values within max(this, MP_AGREE_FRAC of the median in K) of the median agree
+NOT_MELT_RE = re.compile(r"decompos|\bdec\b\.?|sublim|triple point", re.IGNORECASE)  # non-melting notes
+MP_AGREE_C = 5.0 # values within max(this, MP_AGREE_FRAC of the median in K) of the median agree
 MP_AGREE_FRAC = 0.02  # 2 % of absolute temperature: ~6 K near room temperature, ~46 K for Al2O3
 
 
@@ -625,7 +626,7 @@ def _mp_values(pugview):
                     val = item.get("Value", {}) or {}
                     for sm in val.get("StringWithMarkup", []) or []:
                         s = sm.get("String") or ""
-                        if "decompos" in s.lower():
+                        if NOT_MELT_RE.search(s):
                             continue
                         m = MP_VALUE_RE.match(s)
                         if m:
@@ -1396,6 +1397,14 @@ def _selftest():
     assert LEAK_RE.search(_leak_text("Ice melts at 0 °C (PubChem CID 962)."))
     assert not LEAK_RE.search(_leak_text("x <!--OPENALEX_START-->OpenAlex W1<!--OPENALEX_END-->"))
     assert LEAK_RE.search(_leak_text("Cited 12 times per OpenAlex."))
+    for t in ("Ice (CID: 962).", "Ice (CID#962).", "Its SMILES is O.", "IUPAC name oxidane.", "MW 18.015 g/mol, formula H2O."):
+        assert LEAK_RE.search(_leak_text(t)), t
+    for t in ("Water is a PCM.", "The molecular weight of the paraffin is 350 g/mol.", "Cited in the CID-Sweden project",
+              "Water. " + blk.replace("PubChem", "PubChem facts SMILES IUPAC MW 18 g/mol CID: 962")):
+        assert not LEAK_RE.search(_leak_text(t)), t
+    assert LEAK_RE.search(_leak_text("PubChem facts: Formula Al."))
+    mpv = pvs("135 °C (dec.)", "180 °C sublimes", "56.6 °C at the triple point", "99 °C (decomposes)", "58.5 °C")
+    assert [v[2] for v in _mp_values(mpv)] == ["58.5 °C"], _mp_values(mpv)
     old_g = GRAPHML
     with tempfile.TemporaryDirectory() as tmp:
         GRAPHML = Path(tmp) / "g.graphml"
