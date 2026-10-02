@@ -183,6 +183,20 @@ def _save_collected(path, obj):
     os.replace(tmp, p)
 
 
+NEW_ENTITIES_FILE = "collect_new_entities.json"  # under CACHE_DIR; Claude's review list after a collect
+
+
+def _save_new_entities(path, collected, verify_keys0):
+    """Names to review: collected entities with no verify.json entry when the run STARTED (verify_match
+    fills verify.json during the run, so the end state cannot tell). Names from a previous run's file are
+    kept while still collected (a resumed run finds them already verified); the rest of the old file is dropped."""
+    p = Path(path)
+    prev = set(json.loads(p.read_text(encoding="utf-8"))) if p.exists() else set()
+    new = sorted(n for n in collected if n not in verify_keys0 or n in prev)
+    _save_collected(p, new)
+    return new
+
+
 # ---------------------------------------------------------------- step 1: enumerate
 def _find_key(root, attr_name):
     """graphml <key> id for node attr `attr_name`, or None."""
@@ -821,6 +835,7 @@ async def run(args):
 
     judge_cache = load_judge_cache()
     verify_cache = load_verify_cache()
+    verify_keys0 = set(verify_cache)  # snapshot: verify_match adds entries during this run
     log(f"[judge] classifying {len(names)} names (Semaphore 2)...")
     verdicts = await judge_all(names, judge_cache, args.refresh)
     if _glm["stop"]:  # judge.json already saved by judge_all; stop BEFORE any PubChem fetch / graph write
@@ -906,6 +921,7 @@ async def run(args):
     finally:  # a mid-loop kill still leaves a usable partial collect file
         if args.collect:
             _save_collected(args.collect, collected)
+            new_ents = _save_new_entities(CACHE_DIR / NEW_ENTITIES_FILE, collected, verify_keys0)
 
     log("\n==== SUMMARY ====")
     for k, v in stats.items():
@@ -915,6 +931,7 @@ async def run(args):
         log("  (dry-run: no writes performed)")
     if args.collect:
         log(f"  collected: {len(collected)} -> {args.collect}")
+        log(f"  new entities for Claude review: {len(new_ents)} -> {CACHE_DIR / NEW_ENTITIES_FILE}")
     if error_names:
         log("  nodes that hit [error] may carry a marker with a stale vector; "
             "re-run with --refresh:")
@@ -1439,6 +1456,16 @@ def _selftest():
         assert ex.code == 3, ex.code
     else:
         raise AssertionError("require_lightrag did not exit")
+    with tempfile.TemporaryDirectory() as tmp:  # _save_new_entities: only collected names that had no verify entry at start
+        nf = Path(tmp) / "sub" / "new.json"
+        coll = {"A": {}, "B": {}, "C": {}}
+        assert _save_new_entities(nf, coll, {"A"}) == ["B", "C"]
+        assert json.loads(nf.read_text(encoding="utf-8")) == ["B", "C"]
+        # resumed run: B/C now have verify entries but are still collected -> kept; Z (not collected) dropped
+        nf.write_text(json.dumps(["B", "Z"]), encoding="utf-8")
+        assert _save_new_entities(nf, coll, {"A", "B", "C"}) == ["B"]
+        assert _save_new_entities(nf, {}, set()) == []
+        assert os.listdir(nf.parent) == ["new.json"]
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     asyncio.run(_selftest_verify())

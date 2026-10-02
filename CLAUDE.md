@@ -38,10 +38,12 @@
   Before the FIRST source of an ingest queue: `python lightrag\enrich_pubchem.py --fix-blocks --strip-all
   --collect lightrag\data\enrich_cache\pending_strip_all.json --force`, then apply it with
   `ingest.ps1 -DescFile` (push rules apply). After the LAST source is verified: pcm-PubChem-runner
-  MODE=collect; then Claude reviews every `[collected]` line whose entity has no entry in the verify
-  cache yet (same-substance check; GLM verify alone is not enough for NEW entities) and records the
-  verdicts as in plan Task 3 Step 4 (`same` true/false, `by: claude-review`, in verify.json); rejected
-  ones go to EXCLUDE; then MODE=apply (re-adds blocks from the judge/verify/PubChem caches).
+  MODE=collect; then Claude reviews exactly the names in
+  `lightrag\data\enrich_cache\collect_new_entities.json` (the collected entities that had no verify.json
+  entry when the collect run STARTED; collect prints the count; selecting by "no entry now" finds nothing,
+  because the GLM verdict is written to verify.json during collect). Same-substance check; GLM verify
+  alone is not enough for NEW entities. Record the verdicts as in plan Task 3 Step 4 (`same` true/false,
+  `by: claude-review`, in verify.json); rejected ones go to EXCLUDE; then MODE=apply (re-adds blocks from the judge/verify/PubChem caches).
   Then `python lightrag\enrich_pubchem.py --scan-leaks` must exit 0. Exit 7 = leaked facts: clean them
   as in docs/superpowers/plans/2026-09-30-rag-data-integrity.md Task 4 before anything else.
   `--strip-all` strips only PubChem blocks; OpenAlex reference blocks (`<!--OPENALEX_START-->`,
