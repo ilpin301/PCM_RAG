@@ -1,9 +1,12 @@
 """Apply data/audit/edge_edits.json [{source, target, old, new}] via POST /graph/relation/edit.
 
-Sequential (each call rewrites the graphml), resumable: an edge whose current description already
-equals "new" is skipped; one whose current description is neither old nor new is reported as
-CHANGED and left alone. Current descriptions come from GET /graphs around the source entity.
-Log: data/audit/apply_edge_edits.log.   python apply_edge_edits.py [--apply]
+Sequential (each call rewrites the graphml), resumable: an edge whose graph description equals "new"
+counts as done ("already") only when its relation vector is also in Qdrant (COLL, content ends with
+the new description); otherwise it is re-embedded ("revectored") or reported VECTOR_MISSING. One whose
+current description is neither old nor new is reported as CHANGED and left alone. Current descriptions
+come from GET /graphs around the source entity. --apply starts with LightRAG and Ollama preflight
+checks; --selftest runs pure-function asserts.
+Log: data/audit/apply_edge_edits.log.   python apply_edge_edits.py [--apply | --selftest]
 """
 import json
 import os

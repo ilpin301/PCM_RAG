@@ -38,9 +38,16 @@
   Before the FIRST source of an ingest queue: `python lightrag\enrich_pubchem.py --fix-blocks --strip-all
   --collect lightrag\data\enrich_cache\pending_strip_all.json --force`, then apply it with
   `ingest.ps1 -DescFile` (push rules apply). After the LAST source is verified: pcm-PubChem-runner
-  MODE=full (re-adds blocks from the judge/verify/PubChem caches; only new entities cost GLM calls),
-  then `python lightrag\enrich_pubchem.py --scan-leaks` must exit 0. Exit 7 = leaked facts: clean them
+  MODE=collect; then Claude reviews every `[collected]` line whose entity has no entry in the verify
+  cache yet (same-substance check; GLM verify alone is not enough for NEW entities) and records the
+  verdicts as in plan Task 3 Step 4 (`same` true/false, `by: claude-review`, in verify.json); rejected
+  ones go to EXCLUDE; then MODE=apply (re-adds blocks from the judge/verify/PubChem caches).
+  Then `python lightrag\enrich_pubchem.py --scan-leaks` must exit 0. Exit 7 = leaked facts: clean them
   as in docs/superpowers/plans/2026-09-30-rag-data-integrity.md Task 4 before anything else.
+  `--strip-all` strips only PubChem blocks; OpenAlex reference blocks (`<!--OPENALEX_START-->`,
+  ref_text nodes) can be absorbed into prose by an ingest just the same, there is no strip tool for
+  them until OpenAlex Task 8 is run, so the post-ingest `--scan-leaks` (it matches the literal word
+  OpenAlex too) is the only guard for them; exit 7 -> clean as in Task 4.
 
 ## This base
 - Server `pcm_rag-lightrag-1`, port 9622, `COMPOSE_PROJECT_NAME=pcm_rag` in `lightrag\.env`.
