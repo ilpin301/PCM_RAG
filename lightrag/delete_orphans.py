@@ -4,6 +4,13 @@ Only deleted_doc_only items. Nodes first (their edges go with them), then edges 
 endpoints both survive. Sequential - every call rewrites the graphml. Resumable: an item that is
 already gone counts as done. Log: data/audit/delete_orphans.log, one line per item.
 
+--apply first checks that LightRAG is reachable (FATAL, exit 3, nothing written otherwise).
+Every delete rewrites the graphml, so its mtime moves past orphans.json and the freshness guard
+then refuses (exit 2). To resume after a delete run (or after --limit N), first re-run
+`python audit_integrity.py orphans`, then --apply again.
+Exit codes: 0 clean; 1 when any node is blocked by the cascade guard (also on a dry run, where
+that is the only reason for 1) or a delete failed; 2 refused (orphans.json missing or stale).
+
   python delete_orphans.py            # dry: counts only
   python delete_orphans.py --apply [--limit N]
   python delete_orphans.py --selftest
@@ -91,7 +98,36 @@ def _selftest():
         os.utime(o, (3000, 3000))
         assert stale_reason(o, gm) is None
         assert "missing" in stale_reason(Path(d, "nope.json"), gm)
+        _preflight_selftest(d)
     print("selftest OK")
+
+
+def _preflight_selftest(d):
+    """--apply must call require_lightrag before touching anything; dry mode must not call it."""
+    g = globals()
+    saved = (g["AUDIT"], ep.require_lightrag, httpx.Client)
+    calls = []
+
+    def down():
+        calls.append(1)
+        raise SystemExit(3)
+
+    def boom(*a, **k):
+        raise AssertionError("no HTTP client may be opened")
+
+    g["AUDIT"], ep.require_lightrag, httpx.Client = Path(d, "audit"), down, boom
+    try:
+        try:
+            main(["--apply"])
+            raise AssertionError("--apply with LightRAG down must exit")
+        except SystemExit as e:
+            assert e.code == 3, e.code
+        assert calls == [1] and not Path(d, "audit").exists()
+        ep.require_lightrag = lambda: calls.append(2)
+        assert main([]) == 2 and calls == [1]  # dry run: no preflight (empty audit dir -> REFUSING)
+        assert main(["--apply"]) == 2 and calls == [1, 2]  # preflight passed, then stale refusal
+    finally:
+        g["AUDIT"], ep.require_lightrag, httpx.Client = saved
 
 
 def main(argv):
@@ -99,6 +135,8 @@ def main(argv):
         return _selftest()
     apply = "--apply" in argv
     limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
+    if apply:
+        ep.require_lightrag()  # FATAL + exit 3 before any delete call or log write
     store = audit_integrity.STORE
     why = stale_reason(AUDIT / "orphans.json", audit_integrity.GRAPHML)
     if why:
