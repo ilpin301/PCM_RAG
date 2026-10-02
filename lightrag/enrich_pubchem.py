@@ -592,7 +592,7 @@ MP_VALUE_RE = re.compile(
     r"(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*(?:(?:-|to|–)\s*-?[\d,]+(?:\.\d+)?\s*)?(?:°\s*|deg\s*)?([CFK])\b",
     re.IGNORECASE,
 )
-NOT_MELT_RE = re.compile(r"decompos|\bdec\b\.?|sublim|triple point", re.IGNORECASE)  # non-melting notes
+NOT_MELT_RE = re.compile(r"decompos|\bdec\b\.?|sublim|\bsubl\b\.?|triple p(?:oin)?t|\bboil", re.IGNORECASE)  # non-melting notes
 MP_AGREE_C = 5.0 # values within max(this, MP_AGREE_FRAC of the median in K) of the median agree
 MP_AGREE_FRAC = 0.02  # 2 % of absolute temperature: ~6 K near room temperature, ~46 K for Al2O3
 
@@ -1405,6 +1405,11 @@ def _selftest():
     assert LEAK_RE.search(_leak_text("PubChem facts: Formula Al."))
     mpv = pvs("135 °C (dec.)", "180 °C sublimes", "56.6 °C at the triple point", "99 °C (decomposes)", "58.5 °C")
     assert [v[2] for v in _mp_values(mpv)] == ["58.5 °C"], _mp_values(mpv)
+    for marker in ("(dec.)", "dec.", "(dec)", "decomposes", "with decomposition", "sublimes", "sublimation", "(subl.)",
+                   "subl.", "at the triple point", "triple pt", "(boils)", "boils at this temperature"):
+        assert _mp_values(pvs(f"150 °C {marker}")) == [], marker
+    for ok in ("150 °C", "MP: 150 °C", "2,446 °C", "43-45 °C", "111 °F (NTP, 1992)", "300 K"):
+        assert len(_mp_values(pvs(ok))) == 1, ok
     old_g = GRAPHML
     with tempfile.TemporaryDirectory() as tmp:
         GRAPHML = Path(tmp) / "g.graphml"
