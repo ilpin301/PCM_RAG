@@ -104,7 +104,11 @@ MARK_END = "<!--PUBCHEM_END-->"
 BLOCK_RE = re.compile(r"<!--PUBCHEM_START-->.*?<!--PUBCHEM_END-->", re.DOTALL)
 OPENALEX_BLOCK_RE = re.compile(r"<!--OPENALEX_START-->.*?<!--OPENALEX_END-->", re.DOTALL)
 LEAK_RE = re.compile(r"PubChem|OpenAlex|\bCID\s*[:#]?\s*\d+|\bSMILES\b|\bIUPAC\b|\bInChI(?:Key)?\b|\b[A-Z]{14}-[A-Z]{10}-[A-Z]\b"
-                     r"|\b(?:MW|molecular (?:weight|mass))\s*(?:of|is|:|=)?\s*\d+(?:[.,]\d+)?\s*g/mol", re.IGNORECASE)  # enrichment facts outside a block, incl. paraphrase
+                     r"|\b(?:MW|molecular (?:weight|mass))\s*(?:of|is|:|=)?\s*\d+(?:[.,]\d+)?\s*g/mol"
+                     r"|\bCited by [\d,]+ \(as of \d{4}-\d{2}\)|\bOpen-access PDF\b|\bW\d{8,}\b"
+                     r"|\bmolar mass\b[^.\n]{0,40}?\d+(?:[.,]\d+)?\s*g/mol|\(\d+[.,]\d{2,}\s*g/mol\)",
+                     re.IGNORECASE)  # enrichment facts outside a block, incl. paraphrase and reworded forms
+# ponytail: "(N g/mol)" needs >=2 decimals so a polymer grade like "PEG (400 g/mol)" is not a leak; PubChem MW has 3
 
 
 def _leak_text(desc):
@@ -1428,6 +1432,16 @@ def _selftest():
     for t in ("The molecular weight of polyethylene glycol is high.", "Molecular weight distribution was narrow.",
               "Water. " + blk.replace("PubChem", "PubChem InChI=1S/H2O XLYOFNOQVPJJNP-UHFFFAOYSA-N"),
               "x <!--OPENALEX_START-->InChI=1S/H2O<!--OPENALEX_END-->"):
+        assert not LEAK_RE.search(_leak_text(t)), t
+    for t in ("Cited by 12 (as of 2026-07).", "cited by 1,204 (as of 2026-07)", "Open-access PDF: https://x.org/a.pdf",
+              "Work W2741809807 describes it.", "The molar mass of ice is about 18.015 g/mol.", "Water (18.015 g/mol) melts.",
+              "x <!--OPENALEX_START-->ok<!--OPENALEX_END--> Cited by 3 (as of 2026-07)"):
+        assert LEAK_RE.search(_leak_text(t)), t
+    for t in ("Cited by several authors.", "Cited by 12 groups in 2026.", "An open-access paper.", "The PDF is open access.",
+              "Sample W12345 and W1234567 were tested.", "Grade AW12345678 steel.", "The molar mass distribution was narrow.",
+              "PEG (400 g/mol) was used.", "Molar mass of the polymer is not reported.",
+              "x <!--OPENALEX_START-->Cited by 3 (as of 2026-07). Open-access PDF: u. W2741809807<!--OPENALEX_END-->",
+              "Water. " + blk.replace("PubChem", "molar mass 18.015 g/mol (18.015 g/mol)")):
         assert not LEAK_RE.search(_leak_text(t)), t
     mpv = pvs("135 °C (dec.)", "180 °C sublimes", "56.6 °C at the triple point", "99 °C (decomposes)", "58.5 °C")
     assert [v[2] for v in _mp_values(mpv)] == ["58.5 °C"], _mp_values(mpv)
