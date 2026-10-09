@@ -130,10 +130,11 @@ CHEM_FORMULA = re.compile(r"^[A-Z][a-z]?\d|·|H2O|Na2|CaCl2")
 
 GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 
-# global PubChem throttle: adaptive baseline 1.2s between calls (~0.83 req/s); the interval
+# global PubChem throttle: adaptive baseline 2.0s between calls (~0.5 req/s); the interval
 # grows on 429/ServerBusy responses and pauses the whole run when PubChem blocks the IP
-# (dynamic throttling escalates if you keep requesting during a block)
-PUBCHEM_MIN_INTERVAL = 1.2
+# (dynamic throttling escalates if you keep requesting during a block). The
+# X-Throttling-Control response header also lifts it proactively (see _throttle_floor).
+PUBCHEM_MIN_INTERVAL = 2.0
 _pubchem_interval = PUBCHEM_MIN_INTERVAL  # the live adaptive value
 PUBCHEM_MAX_INTERVAL = 30.0
 PUBCHEM_BLOCK_STREAK = 3  # consecutive blocked items that trigger a long pause
@@ -609,6 +610,24 @@ def _fault_code(r):
         return None
 
 
+_THROTTLE_RE = re.compile(r"([A-Za-z ]+?)\s+status:\s*(Green|Yellow|Red|Black)\b", re.IGNORECASE)
+_OUR_TRAFFIC_FLOOR = {"yellow": 3.0, "red": 8.0, "black": 20.0}
+_SERVICE_FLOOR = {"red": 4.0, "black": 8.0}  # global PubChem load, not our traffic: only severe
+
+
+def _throttle_floor(headers):
+    """Minimum interval (s) implied by PubChem's X-Throttling-Control header; 0.0 if absent/odd."""
+    try:
+        value = headers.get("X-Throttling-Control") if headers is not None else None
+        floor = 0.0
+        for name, color in _THROTTLE_RE.findall(value or ""):
+            table = _SERVICE_FLOOR if name.strip().lower() == "service" else _OUR_TRAFFIC_FLOOR
+            floor = max(floor, table.get(color.lower(), 0.0))
+        return floor
+    except Exception:
+        return 0.0
+
+
 async def _pubchem_get(client, url):
     """JSON dict; None = 404 / Fault NotFound (genuine not-found); FetchFailed = retries exhausted.
     Any other Fault body (ServerBusy, Timeout, ServerError...) is retried, never passed through."""
@@ -623,10 +642,13 @@ async def _pubchem_get(client, url):
             blocked = True
             await _sleep(backoff)
             continue
+        floor = _throttle_floor(r.headers)  # applied on every exit below, after any decay/doubling
         if r.status_code == 404:
+            _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, max(_pubchem_interval, floor))
             return None
         fault = _fault_code(r)
         if fault is not None and "NotFound" in fault:
+            _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, max(_pubchem_interval, floor))
             return None
         if r.status_code in RETRY_STATUS or fault is not None:
             # 429/503 or a ServerBusy/Timeout Fault = PubChem throttling this IP: grow the
@@ -635,14 +657,16 @@ async def _pubchem_get(client, url):
                 fault is not None and ("ServerBusy" in fault or "Timeout" in fault))
             if blocked:
                 _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, _pubchem_interval * 2)
+            _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, max(_pubchem_interval, floor))
             try:
                 retry = int(r.headers.get("Retry-After", backoff))
             except ValueError:  # HTTP-date form
                 retry = backoff
             await _sleep(retry)
             continue
-        r.raise_for_status()
         _pubchem_interval = max(PUBCHEM_MIN_INTERVAL, _pubchem_interval * 0.9)  # relax toward baseline
+        _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, max(_pubchem_interval, floor))
+        r.raise_for_status()
         return r.json()
     err = FetchFailed(url)
     err.blocked = blocked
@@ -1283,13 +1307,35 @@ async def _selftest_fetch():
             lookups.clear()
             assert await _cid_lookup(c, "water", 2) is None and len(lookups) == 3
         # adaptive interval + blocked flag: 429/ServerBusy grow _pubchem_interval, a success decays it
-        PUBCHEM_MIN_INTERVAL = _pubchem_interval = 1.2
+        base = PUBCHEM_MIN_INTERVAL = _pubchem_interval = old_int  # the real baseline
         e = await run_exc(*[(429, {})] * 5)
         assert type(e) is FetchFailed and e.blocked is True  # a 429 streak = IP block
-        assert _pubchem_interval > 1.2
-        _pubchem_interval = 1.2
+        assert _pubchem_interval > base
+        _pubchem_interval = base
         assert await run((429, {}), (200, ok)) == (ok, 2)
-        assert 1.2 <= _pubchem_interval <= 2.4  # a success after a 429 decays the doubled value
+        assert base <= _pubchem_interval <= base * 2  # a success after a 429 decays the doubled value
+        # X-Throttling-Control header -> minimum interval
+        def tc(c, t, s):
+            return {"X-Throttling-Control": f"Request Count status: {c}, Request Time status: {t}, Service status: {s}"}
+        assert _throttle_floor((tc("Green (0%)", "Green (0%)", "Yellow (50%)"))) == 0.0
+        assert _throttle_floor((tc("Yellow (30%)", "Green (0%)", "Green (0%)"))) == 3.0
+        assert _throttle_floor((tc("Green (0%)", "Red (80%)", "Green (0%)"))) == 8.0
+        assert _throttle_floor((tc("Black (100%)", "Green (0%)", "Green (0%)"))) == 20.0
+        assert _throttle_floor((tc("Green (0%)", "Green (0%)", "Red (80%)"))) == 4.0
+        assert _throttle_floor((tc("Green (0%)", "Green (0%)", "Black (100%)"))) == 8.0
+        assert _throttle_floor({}) == 0.0 and _throttle_floor(None) == 0.0
+        assert _throttle_floor({"X-Throttling-Control": ""}) == 0.0
+        assert _throttle_floor({"X-Throttling-Control": "garbage ::: 12"}) == 0.0
+        # a success response carrying a Red request-count header lifts the interval past the decay
+        _pubchem_interval = base
+
+        def red_handler(request):
+            return httpx.Response(200, json=ok, headers=tc("Red (80%)", "Green (0%)", "Green (0%)"))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(red_handler)) as c:
+            assert await _pubchem_get(c, "http://x/y") == ok
+        assert _pubchem_interval >= 8.0
+        _pubchem_interval = base
         assert (await run_exc(*[(200, busy)] * 5)).blocked is True  # ServerBusy Fault = block signal
         assert (await run_exc(*[(200, srverr)] * 5)).blocked is False  # a plain Fault is not
 
