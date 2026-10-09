@@ -40,6 +40,7 @@ EXIT CODES:
      Re-run the same command after reset_at; judged names, PubChem cache and graph markers skip finished work.
      With the verify step (normal runs, --fix-blocks --verify) it can also stop mid-loop; a --collect FILE
      then holds verified entries only - re-collect after reset_at instead of applying it.
+  5  PubChem still blocking this IP (429/ServerBusy streak) or link down, after one long pause; partial --collect file is saved - re-run later, caches skip finished work
   7  --scan-leaks found leaked facts outside the blocks
 """
 import argparse
@@ -129,14 +130,20 @@ CHEM_FORMULA = re.compile(r"^[A-Z][a-z]?\d|·|H2O|Na2|CaCl2")
 
 GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 
-# global PubChem throttle: flat 0.8s between calls
-# (~1.25 req/s = 375 calls/5 min, under both the 5/s and 400/5-min caps)
-PUBCHEM_MIN_INTERVAL = 0.8
+# global PubChem throttle: adaptive baseline 1.2s between calls (~0.83 req/s); the interval
+# grows on 429/ServerBusy responses and pauses the whole run when PubChem blocks the IP
+# (dynamic throttling escalates if you keep requesting during a block)
+PUBCHEM_MIN_INTERVAL = 1.2
+_pubchem_interval = PUBCHEM_MIN_INTERVAL  # the live adaptive value
+PUBCHEM_MAX_INTERVAL = 30.0
+PUBCHEM_BLOCK_STREAK = 3  # consecutive blocked items that trigger a long pause
+PUBCHEM_BLOCK_PAUSE_S = 300.0
 _last_pubchem_call = 0.0
 
 
 class FetchFailed(Exception):
     """PubChem fetch gave up after retries (network/429/503) - NOT the same as unresolved."""
+    blocked = False  # True when the last attempt signalled PubChem IP throttling (429/ServerBusy/Timeout) or the link is down
 
 
 def log(msg):
@@ -552,12 +559,40 @@ async def _sleep(s):
 
 
 async def _throttle():
-    global _last_pubchem_call
+    global _pubchem_interval, _last_pubchem_call
     now = time.monotonic()
-    wait = PUBCHEM_MIN_INTERVAL - (now - _last_pubchem_call)
+    wait = _pubchem_interval - (now - _last_pubchem_call)
     if wait > 0:
         await _sleep(wait)
     _last_pubchem_call = time.monotonic()
+
+
+class _PubchemBreaker:
+    """Run-level circuit breaker for PubChem IP blocks: a streak of blocked items
+    pauses the whole run once; a second streak after that pause exits 5 so the
+    caller's finally-block saves the partial --collect file (hammering during a
+    block escalates its duration - PubChem dynamic request throttling)."""
+    def __init__(self):
+        self.streak = 0
+        self.pauses = 0
+
+    def ok(self):
+        self.streak = 0
+
+    async def blocked(self):
+        self.streak += 1
+        if self.streak < PUBCHEM_BLOCK_STREAK:
+            return
+        self.streak = 0
+        if self.pauses >= 1:
+            log("PubChem is STILL blocking this IP after a pause; stopping (exit 5). "
+                "Partial work is saved and cached; wait ~30-60 min, then re-run the "
+                "same command - judge/verify/CID caches skip finished work.")
+            sys.exit(5)
+        self.pauses += 1
+        log(f"PubChem blocked {PUBCHEM_BLOCK_STREAK} items in a row; pausing "
+            f"{PUBCHEM_BLOCK_PAUSE_S:.0f}s to let the IP block lift")
+        await _sleep(PUBCHEM_BLOCK_PAUSE_S)
 
 
 RETRY_STATUS = (429, 500, 502, 503, 504)
@@ -577,12 +612,15 @@ def _fault_code(r):
 async def _pubchem_get(client, url):
     """JSON dict; None = 404 / Fault NotFound (genuine not-found); FetchFailed = retries exhausted.
     Any other Fault body (ServerBusy, Timeout, ServerError...) is retried, never passed through."""
+    global _pubchem_interval
+    blocked = False
     for attempt in range(PUBCHEM_ATTEMPTS):
         await _throttle()
         backoff = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 s
         try:
             r = await client.get(url, headers=PUBCHEM_HEADERS, timeout=60)
-        except httpx.TransportError:  # includes timeouts
+        except httpx.TransportError:  # transport error = link down, treated as a block so the breaker pauses instead of burning items
+            blocked = True
             await _sleep(backoff)
             continue
         if r.status_code == 404:
@@ -591,6 +629,12 @@ async def _pubchem_get(client, url):
         if fault is not None and "NotFound" in fault:
             return None
         if r.status_code in RETRY_STATUS or fault is not None:
+            # 429/503 or a ServerBusy/Timeout Fault = PubChem throttling this IP: grow the
+            # global interval (500/502/504 and other faults are ordinary server hiccups)
+            blocked = r.status_code in (429, 503) or (
+                fault is not None and ("ServerBusy" in fault or "Timeout" in fault))
+            if blocked:
+                _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, _pubchem_interval * 2)
             try:
                 retry = int(r.headers.get("Retry-After", backoff))
             except ValueError:  # HTTP-date form
@@ -598,8 +642,11 @@ async def _pubchem_get(client, url):
             await _sleep(retry)
             continue
         r.raise_for_status()
+        _pubchem_interval = max(PUBCHEM_MIN_INTERVAL, _pubchem_interval * 0.9)  # relax toward baseline
         return r.json()
-    raise FetchFailed(url)
+    err = FetchFailed(url)
+    err.blocked = blocked
+    raise err
 
 
 def _norm(s):
@@ -858,6 +905,7 @@ async def run(args):
             "good verdicts are cached.")
         sys.exit(2)
 
+    breaker = _PubchemBreaker()
     try:
         async with httpx.AsyncClient(trust_env=False) as client:
             for name, canonical in compounds:
@@ -875,6 +923,7 @@ async def run(args):
                             continue
 
                     facts = await pubchem_fetch(client, canonical)
+                    breaker.ok()  # PubChem answered (facts or None): no IP block
                     if not facts:
                         log(f"[unresolved] {name!r} (canonical={canonical!r})")
                         stats["unresolved"] += 1
@@ -915,7 +964,9 @@ async def run(args):
                         await write_entity(client, name, new_desc)
                         log(f"[enriched] {name!r} -> CID {facts['cid']} mp={facts['mp']}")
                     stats["enriched"] += 1
-                except FetchFailed:
+                except FetchFailed as e:
+                    if e.blocked:
+                        await breaker.blocked()
                     log(f"[fetch_failed] {name!r} (canonical={canonical!r})")
                     stats["fetch_failed"] += 1
                 except Exception as e:
@@ -1017,6 +1068,7 @@ async def fix_blocks(args):
     log(f"[fix] {len(names)} nodes carry a PubChem block")
     cache = load_judge_cache()
 
+    breaker = _PubchemBreaker()
     try:
         async with httpx.AsyncClient(trust_env=False) as client:
             for name in names:
@@ -1043,6 +1095,7 @@ async def fix_blocks(args):
                             stats["keep_unjudged"] += 1
                             continue
                         facts = await pubchem_fetch(client, v["canonical"], notfound_retries=2)
+                        breaker.ok()  # PubChem answered (facts or None): no IP block
                         if facts is None:  # resolution failure is never grounds to strip
                             log(f"[fix:keep-unresolved] {name!r} (canonical={v['canonical']!r})")
                             stats["keep_unresolved"] += 1
@@ -1091,7 +1144,9 @@ async def fix_blocks(args):
                                                encoding="utf-8")
                         await write_entity(client, name, new_desc)
                     stats[kind] += 1
-                except FetchFailed:
+                except FetchFailed as e:
+                    if e.blocked:
+                        await breaker.blocked()
                     log(f"[fix:fetch_failed] {name!r}")
                     stats["fetch_failed"] += 1
                 except Exception as e:
@@ -1162,7 +1217,7 @@ async def _selftest_pubchem_fetch():
 
 async def _selftest_fetch():
     """_pubchem_get retry/None/FetchFailed behaviour against httpx.MockTransport, no network."""
-    global PUBCHEM_MIN_INTERVAL, _sleep
+    global PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval
     busy = {"Fault": {"Code": "PUGREST.ServerBusy", "Message": "Too many requests"}}
     ok = {"IdentifierList": {"CID": [962]}}
 
@@ -1181,12 +1236,25 @@ async def _selftest_fetch():
             except FetchFailed:
                 return "FetchFailed", len(calls)
 
-    old_int, old_sleep = PUBCHEM_MIN_INTERVAL, _sleep
+    async def run_exc(*replies):  # like run, but returns the FetchFailed itself (for .blocked)
+        it = iter(replies)
+
+        def handler(request):
+            status, body = next(it, replies[-1])
+            return httpx.Response(status, json=body)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            try:
+                return await _pubchem_get(c, "http://x/y")
+            except FetchFailed as e:
+                return e
+
+    old_int, old_sleep, old_pint = PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval
 
     async def no_sleep(s):
         pass
 
-    PUBCHEM_MIN_INTERVAL, _sleep = 0, no_sleep
+    PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval = 0, no_sleep, 0
     try:
         assert await run((200, busy), (200, ok)) == (ok, 2)  # ServerBusy Fault on a 200
         assert await run((502, {}), (200, ok)) == (ok, 2)
@@ -1214,9 +1282,56 @@ async def _selftest_fetch():
             assert await _cid_lookup(c, "water", 0) is None and len(lookups) == 1
             lookups.clear()
             assert await _cid_lookup(c, "water", 2) is None and len(lookups) == 3
+        # adaptive interval + blocked flag: 429/ServerBusy grow _pubchem_interval, a success decays it
+        PUBCHEM_MIN_INTERVAL = _pubchem_interval = 1.2
+        e = await run_exc(*[(429, {})] * 5)
+        assert type(e) is FetchFailed and e.blocked is True  # a 429 streak = IP block
+        assert _pubchem_interval > 1.2
+        _pubchem_interval = 1.2
+        assert await run((429, {}), (200, ok)) == (ok, 2)
+        assert 1.2 <= _pubchem_interval <= 2.4  # a success after a 429 decays the doubled value
+        assert (await run_exc(*[(200, busy)] * 5)).blocked is True  # ServerBusy Fault = block signal
+        assert (await run_exc(*[(200, srverr)] * 5)).blocked is False  # a plain Fault is not
+
+        def dead(request):
+            raise httpx.ConnectError("no route")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(dead)) as c:
+            try:
+                await _pubchem_get(c, "http://x/y")
+                raise AssertionError("no FetchFailed")
+            except FetchFailed as e:
+                assert e.blocked is True  # transport errors = link down, counted as a block
+        PUBCHEM_MIN_INTERVAL = _pubchem_interval = 0
         await _selftest_pubchem_fetch()
     finally:
-        PUBCHEM_MIN_INTERVAL, _sleep = old_int, old_sleep
+        PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval = old_int, old_sleep, old_pint
+
+
+async def _selftest_breaker():
+    """_PubchemBreaker: a blocked streak pauses the run once (via _sleep); a second streak exits 5."""
+    global _sleep
+    old_sleep = _sleep
+    calls = []
+
+    async def rec(s):
+        calls.append(s)
+
+    _sleep = rec
+    try:
+        b = _PubchemBreaker()
+        for _ in range(PUBCHEM_BLOCK_STREAK):
+            await b.blocked()
+        assert calls == [PUBCHEM_BLOCK_PAUSE_S]  # exactly one long pause, no exit
+        try:
+            for _ in range(PUBCHEM_BLOCK_STREAK):
+                await b.blocked()
+            raise AssertionError("second streak did not exit")
+        except SystemExit as e:
+            assert e.code == 5
+        assert calls == [PUBCHEM_BLOCK_PAUSE_S]  # the second streak exits instead of pausing again
+    finally:
+        _sleep = old_sleep
 
 
 async def _selftest_quota_stop():
@@ -1483,6 +1598,7 @@ def _selftest():
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     asyncio.run(_selftest_verify())
+    asyncio.run(_selftest_breaker())
     print("selftest OK")
 
 
