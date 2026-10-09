@@ -136,7 +136,7 @@ GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 # X-Throttling-Control response header also lifts it proactively (see _throttle_floor).
 PUBCHEM_MIN_INTERVAL = 2.0
 _pubchem_interval = PUBCHEM_MIN_INTERVAL  # the live adaptive value
-PUBCHEM_MAX_INTERVAL = 30.0
+PUBCHEM_MAX_INTERVAL = 16.0
 PUBCHEM_BLOCK_STREAK = 3  # consecutive blocked items that trigger a long pause
 PUBCHEM_BLOCK_PAUSE_S = 300.0
 _last_pubchem_call = 0.0
@@ -681,7 +681,7 @@ async def _pubchem_get(client, url):
             _log_fail(url, r.status_code, fault, r.headers, attempt)
             await _sleep(retry)
             continue
-        _pubchem_interval = max(PUBCHEM_MIN_INTERVAL, _pubchem_interval * 0.9)  # relax toward baseline
+        _pubchem_interval = max(PUBCHEM_MIN_INTERVAL, _pubchem_interval * 0.8)  # relax toward baseline
         _pubchem_interval = min(PUBCHEM_MAX_INTERVAL, max(_pubchem_interval, floor))
         r.raise_for_status()
         return r.json()
@@ -1335,6 +1335,10 @@ async def _selftest_fetch():
         _pubchem_interval = base
         assert await run((429, {}), (200, ok)) == (ok, 2)
         assert base <= _pubchem_interval <= base * 2  # a success after a 429 decays the doubled value
+        for _ in range(4):  # a long 429 run (20 mocked 429s) never pushes the interval past the cap
+            await run_exc(*[(429, {})] * 5)
+            assert _pubchem_interval <= PUBCHEM_MAX_INTERVAL == 16.0
+        _pubchem_interval = base
         # X-Throttling-Control header -> minimum interval
         def tc(c, t, s):
             return {"X-Throttling-Control": f"Request Count status: {c}, Request Time status: {t}, Service status: {s}"}
