@@ -48,6 +48,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import statistics
 import sys
 import time
@@ -70,6 +71,8 @@ CACHE_DIR = SCRIPT_DIR / "data" / "enrich_cache"
 JUDGE_CACHE = CACHE_DIR / "judge.json"
 RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
 VERIFY_FILE = "verify.json"  # under CACHE_DIR; GLM same-substance verdicts per (name, CID)
+CID_LOOKUP_FILE = "cid_lookup.json"  # under CACHE_DIR; name -> CID replies, so an exit-5 re-run skips finished lookups
+NOTFOUND_CACHE_TTL_S = 7 * 86400  # a cached name not-found is trusted this long (PubChem adds compounds)
 FACTS_VERSION = 4  # 4: mp only from value-first strings / numbers; no majority of agreeing values -> not available
 
 LIGHTRAG_URL = os.environ.get("LIGHTRAG_URL", "http://127.0.0.1:9622")
@@ -175,7 +178,8 @@ def require_lightrag(url=LIGHTRAG_URL):
 
 
 def _collect_guard(args):
-    """--collect startup checks, before any network work. FILE is never merged, only rebuilt."""
+    """--collect startup checks, before any network work. FILE is never merged, only rebuilt;
+    with --force the old FILE is first kept as FILE.prev so a smaller partial result cannot destroy it."""
     if not args.collect:
         return
     if args.dry_run:
@@ -184,6 +188,8 @@ def _collect_guard(args):
     if os.path.exists(args.collect) and not args.force:
         log(f"FATAL: {args.collect} exists; pass --force to overwrite (a collect file is never merged)")
         sys.exit(1)
+    if os.path.exists(args.collect):  # only reached with --force
+        shutil.copy2(args.collect, args.collect + ".prev")
 
 
 def _save_collected(path, obj):
@@ -770,10 +776,41 @@ def _parse_mp(pugview):
     return near[0][2]
 
 
+_cid_cache = None  # lazily loaded {norm name: {"r": cid_json | None, "ts": epoch s}}; tests reset it to None
+
+
+def _cid_cache_load():
+    global _cid_cache
+    if _cid_cache is None:
+        try:
+            data = json.loads((CACHE_DIR / CID_LOOKUP_FILE).read_text(encoding="utf-8"))
+            _cid_cache = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):  # missing or corrupt: start empty, the next store rewrites it
+            _cid_cache = {}
+    return _cid_cache
+
+
+def _cid_cache_store(key, result):
+    cache = _cid_cache_load()
+    cache[key] = {"r": result, "ts": time.time()}
+    _save_collected(CACHE_DIR / CID_LOOKUP_FILE, cache)
+
+
 async def _cid_lookup(client, canonical, notfound_retries=0):
     """Name -> CID JSON via _pubchem_get; a NotFound (None) is retried notfound_retries times after
     NOTFOUND_RETRY_S. Only --fix-blocks retries: its names all resolved once, so a NotFound there is
-    usually a PubChem hiccup, while a normal run meets many genuine not-founds."""
+    usually a PubChem hiccup, while a normal run meets many genuine not-founds.
+    Definite answers are cached in cid_lookup.json so a re-run after an exit-5 block skips them; a
+    cached not-found is trusted only without retries and for NOTFOUND_CACHE_TTL_S; a FetchFailed
+    or a reply without IdentifierList is never cached."""
+    key = _norm(canonical)
+    hit = _cid_cache_load().get(key)
+    if isinstance(hit, dict):
+        if isinstance(hit.get("r"), dict):
+            return hit["r"]
+        if (hit.get("r") is None and notfound_retries == 0
+                and time.time() - (hit.get("ts") or 0) < NOTFOUND_CACHE_TTL_S):
+            return None
     url = f"{PUBCHEM}/rest/pug/compound/name/{httpx.URL(canonical)}/cids/JSON"
     cid_json = await _pubchem_get(client, url)
     for _ in range(notfound_retries):
@@ -781,6 +818,11 @@ async def _cid_lookup(client, canonical, notfound_retries=0):
             break
         await _sleep(NOTFOUND_RETRY_S)
         cid_json = await _pubchem_get(client, url)
+    if cid_json is None:
+        if notfound_retries == 0:
+            _cid_cache_store(key, None)
+    elif isinstance(cid_json, dict) and "IdentifierList" in cid_json:
+        _cid_cache_store(key, cid_json)
     return cid_json
 
 
@@ -1218,12 +1260,15 @@ async def fix_blocks(args):
 # ---------------------------------------------------------------- selftest
 async def _selftest_pubchem_fetch():
     """pubchem_fetch never turns a bad reply into empty facts or a cache file (caller stubs sleeps)."""
-    global CACHE_DIR
+    global CACHE_DIR, _cid_cache
     import tempfile
     timeout = {"Fault": {"Code": "PUGREST.Timeout"}}
     ids = {"IdentifierList": {"CID": [962]}}
 
     async def fetch(prop, syn):
+        global _cid_cache
+        _cid_cache = None
+
         def handler(request):
             u = str(request.url)
             if "/name/" in u:
@@ -1243,22 +1288,93 @@ async def _selftest_pubchem_fetch():
     old_dir = CACHE_DIR
     with tempfile.TemporaryDirectory() as tmp:
         CACHE_DIR = Path(tmp)
+        _cid_cache = None
         try:
             props = {"PropertyTable": {"Properties": [{"CID": 962, "MolecularFormula": "H2O",
                                                         "ConnectivitySMILES": "O"}]}}
             assert await fetch(props, timeout) == "FetchFailed"
-            assert not list(CACHE_DIR.glob("*.json"))  # nothing cached on a bad synonyms reply
+            # nothing cached per CID on a bad synonyms reply (the name lookup file is separate)
+            assert not [f for f in CACHE_DIR.glob("*.json") if f.name != CID_LOOKUP_FILE]
             syns = {"InformationList": {"Information": [{"CID": 962, "Synonym": ["water"]}]}}
             facts = await fetch(props, syns)
             assert facts and facts["smiles"] == "O", facts  # ConnectivitySMILES rename
             assert json.loads((CACHE_DIR / "962.json").read_text(encoding="utf-8"))["v"] == FACTS_VERSION
         finally:
             CACHE_DIR = old_dir
+            _cid_cache = None
+
+
+async def _selftest_cid_cache():
+    """_cid_lookup name cache: hit skips the request, negative TTL/retry rules, nothing cached on failure."""
+    global _cid_cache
+    ok = {"IdentifierList": {"CID": [962]}}
+    calls = []
+    replies = []
+
+    def handler(request):
+        calls.append(1)
+        status, body = replies.pop(0) if len(replies) > 1 else replies[0]
+        return httpx.Response(status, json=body)
+
+    def on_disk():
+        return json.loads((CACHE_DIR / CID_LOOKUP_FILE).read_text(encoding="utf-8"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        # (a) a positive answer is fetched once, then served from the cache with zero requests
+        (CACHE_DIR / CID_LOOKUP_FILE).unlink(missing_ok=True)  # earlier cases left entries
+        _cid_cache = None
+        replies[:] = [(200, ok)]
+        assert await _cid_lookup(c, "Water", 0) == ok and len(calls) == 1
+        assert await _cid_lookup(c, "  water ", 0) == ok and len(calls) == 1  # key = _norm(name)
+        _cid_cache = None  # and it was persisted: a fresh load reads it back
+        assert await _cid_lookup(c, "water", 2) == ok and len(calls) == 1
+        # (b) a genuine not-found is cached negative; notfound_retries>0 ignores it and stores no negative
+        _cid_cache = None
+        calls.clear()
+        replies[:] = [(404, {})]
+        assert await _cid_lookup(c, "nosuch", 0) is None and len(calls) == 1
+        assert await _cid_lookup(c, "nosuch", 0) is None and len(calls) == 1
+        assert on_disk()["nosuch"]["r"] is None
+        assert await _cid_lookup(c, "nosuch", 1) is None and len(calls) == 3  # lookup + retry after the sleep
+        replies[:] = [(200, ok)]
+        assert await _cid_lookup(c, "nosuch", 1) == ok  # positive replaces the negative
+        assert await _cid_lookup(c, "nosuch", 0) == ok and len(calls) == 4
+        _cid_cache = None
+        calls.clear()
+        replies[:] = [(404, {})]
+        assert await _cid_lookup(c, "neverseen", 1) is None and len(calls) == 2
+        assert "neverseen" not in on_disk()  # no negative stored on the retry path
+        # (c) an expired negative entry is ignored
+        _cid_cache = {"old": {"r": None, "ts": time.time() - NOTFOUND_CACHE_TTL_S - 60}}
+        calls.clear()
+        assert await _cid_lookup(c, "old", 0) is None and len(calls) == 1
+        # (d) a Fault body, a reply without IdentifierList, or FetchFailed writes nothing
+        _cid_cache = {}
+        (CACHE_DIR / CID_LOOKUP_FILE).unlink()
+        for bad in ((200, {"Fault": {"Code": "PUGREST.ServerError"}}), (500, {})):
+            replies[:] = [bad]
+            try:
+                await _cid_lookup(c, "bad", 0)
+                raise AssertionError("no FetchFailed")
+            except FetchFailed:
+                pass
+        replies[:] = [(200, {"Other": 1})]
+        assert await _cid_lookup(c, "odd", 0) == {"Other": 1}
+        assert not (CACHE_DIR / CID_LOOKUP_FILE).exists() and _cid_cache == {}
+    # (e) a corrupt or non-dict cache file loads as empty instead of crashing
+    for junk in ("{not json", "[1, 2]", ""):
+        (CACHE_DIR / CID_LOOKUP_FILE).write_text(junk, encoding="utf-8")
+        _cid_cache = None
+        assert _cid_cache_load() == {}
+    _cid_cache = None
 
 
 async def _selftest_fetch():
     """_pubchem_get retry/None/FetchFailed behaviour against httpx.MockTransport, no network."""
-    global PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval
+    global PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval, CACHE_DIR, _cid_cache
+    import tempfile
+    tmpdir = tempfile.TemporaryDirectory()  # _cid_lookup writes cid_lookup.json: keep it off the real cache
+    old_dir, CACHE_DIR, _cid_cache = CACHE_DIR, Path(tmpdir.name), None
     busy = {"Fault": {"Code": "PUGREST.ServerBusy", "Message": "Too many requests"}}
     ok = {"IdentifierList": {"CID": [962]}}
 
@@ -1323,6 +1439,7 @@ async def _selftest_fetch():
             assert await _cid_lookup(c, "water", 2) == ok and len(lookups) == 2
         seq = iter([(404, {})] * 5)
         lookups.clear()
+        _cid_cache = {}  # the positive above would otherwise answer from the cache
         async with httpx.AsyncClient(transport=httpx.MockTransport(lookup_handler)) as c:
             assert await _cid_lookup(c, "water", 0) is None and len(lookups) == 1
             lookups.clear()
@@ -1375,8 +1492,12 @@ async def _selftest_fetch():
                 assert e.blocked is True  # transport errors = link down, counted as a block
         PUBCHEM_MIN_INTERVAL = _pubchem_interval = 0
         await _selftest_pubchem_fetch()
+        CACHE_DIR, _cid_cache = Path(tmpdir.name), None  # _selftest_pubchem_fetch restored the real dir
+        await _selftest_cid_cache()
     finally:
         PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval = old_int, old_sleep, old_pint
+        CACHE_DIR, _cid_cache = old_dir, None
+        tmpdir.cleanup()
 
 
 async def _selftest_breaker():
