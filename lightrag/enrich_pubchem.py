@@ -628,6 +628,21 @@ def _throttle_floor(headers):
         return 0.0
 
 
+def _url_kind(url):
+    for needle, kind in (("/cids/", "cid"), ("/property/", "props"), ("/synonyms/", "syn"), ("pug_view", "pugview")):
+        if needle in url:
+            return kind
+    return "other"
+
+
+def _log_fail(url, status, fault, headers, attempt):
+    """One diagnostic line per failed PubChem attempt: which endpoint/status/header triggers blocks."""
+    h = headers if headers is not None else {}
+    log(f'[pubchem-fail] kind={_url_kind(url)} status={status} fault={fault or "-"} '
+        f'retry_after={h.get("Retry-After") or "-"} throttle="{h.get("X-Throttling-Control") or "-"}" '
+        f'interval={_pubchem_interval:.1f} attempt={attempt + 1}/{PUBCHEM_ATTEMPTS}')
+
+
 async def _pubchem_get(client, url):
     """JSON dict; None = 404 / Fault NotFound (genuine not-found); FetchFailed = retries exhausted.
     Any other Fault body (ServerBusy, Timeout, ServerError...) is retried, never passed through."""
@@ -638,8 +653,9 @@ async def _pubchem_get(client, url):
         backoff = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 s
         try:
             r = await client.get(url, headers=PUBCHEM_HEADERS, timeout=60)
-        except httpx.TransportError:  # transport error = link down, treated as a block so the breaker pauses instead of burning items
+        except httpx.TransportError as exc:  # transport error = link down, treated as a block so the breaker pauses instead of burning items
             blocked = True
+            _log_fail(url, f"transport:{type(exc).__name__}", None, None, attempt)
             await _sleep(backoff)
             continue
         floor = _throttle_floor(r.headers)  # applied on every exit below, after any decay/doubling
@@ -662,6 +678,7 @@ async def _pubchem_get(client, url):
                 retry = int(r.headers.get("Retry-After", backoff))
             except ValueError:  # HTTP-date form
                 retry = backoff
+            _log_fail(url, r.status_code, fault, r.headers, attempt)
             await _sleep(retry)
             continue
         _pubchem_interval = max(PUBCHEM_MIN_INTERVAL, _pubchem_interval * 0.9)  # relax toward baseline
@@ -1280,6 +1297,10 @@ async def _selftest_fetch():
 
     PUBCHEM_MIN_INTERVAL, _sleep, _pubchem_interval = 0, no_sleep, 0
     try:
+        assert [_url_kind(u) for u in (
+            "https://x/compound/name/a/cids/JSON", "https://x/compound/cid/1/property/X/JSON",
+            "https://x/compound/cid/1/synonyms/JSON", "https://x/rest/pug_view/data/compound/1/JSON",
+            "https://x/y")] == ["cid", "props", "syn", "pugview", "other"]
         assert await run((200, busy), (200, ok)) == (ok, 2)  # ServerBusy Fault on a 200
         assert await run((502, {}), (200, ok)) == (ok, 2)
         assert await run((200, busy)) == ("FetchFailed", PUBCHEM_ATTEMPTS)  # always busy
