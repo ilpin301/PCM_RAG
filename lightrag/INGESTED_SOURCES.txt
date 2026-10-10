@@ -42,3 +42,6 @@ _Application_of_Inorganic_вЂ_Organic_Eutectic_PCM_Phase_Change_Material_to_Imp
 _Analysis_of_the_Thermal_Stability_of_Pcms_and_Its_Effect_on_Energy_Storage_Efficiency.pdf
 _Atomic_Force_Microscopy_for_CrossDisciplinary_Materials_Research.pdf
 _Augmenting_solar_still_productivity_through_phase-change_materials_and_nano-enhanced_PCM_c.pdf  # 22 pp, ONE doc 2026-09-29, MinerU route, ingest_merged.py --pages 10 (3 slices), 80 chunks; 2 transient z.ai 1302, zero permanent loss
+_Confinement_in_MetalOrganic_Frameworks_as_a_Route_to_Harnessing_Liquid_Barocalorics_in_the.pdf  # 9 pp, ONE doc 2026-10-08, MinerU route, 102 chunks, +938 nodes/+3991 edges; zero ERROR/RetryError, zero permanent loss
+_Battery_Thermal_Management_System_in_ElectricVehicles_using_Phase_Change_Material_PCM.pdf  # 2026-10-08 duplicate download of Battery_Thermal_Management_System_in_ElectricVehicles_using_Phase_Change_Material_PCM.pdf (same title/authors, 95% text overlap, preprint layout) - NOT ingested
+_Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building_Envelopes.pdf  # 2026-10-10 duplicate download of Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building_Envelopes_.pdf (same DOI 10.13189/cea.2026.140319, same creationDate, 97.8% word overlap, lacks journal header line) - NOT ingested
