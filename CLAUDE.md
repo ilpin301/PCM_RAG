@@ -37,11 +37,15 @@
   `<!--PUBCHEM_START-->` blocks into plain prose when an ingest re-mentions an enriched entity.
   Before the FIRST source of an ingest queue: `python lightrag\enrich_pubchem.py --fix-blocks --strip-all
   --collect lightrag\data\enrich_cache\pending_strip_all.json --force`, then apply it with
-  `ingest.ps1 -DescFile` (push rules apply). After the LAST source is verified: pcm-PubChem-runner
-  MODE=collect; then Claude reviews exactly the names in
-  `lightrag\data\enrich_cache\collect_new_entities.json` (the collected entities that had no verify.json
-  entry when the collect run STARTED; collect prints the count; selecting by "no entry now" finds nothing,
-  because the GLM verdict is written to verify.json during collect). Same-substance check; GLM verify
+  `ingest.ps1 -DescFile` (NO Drive push after this strip apply - user rule 2026-10-10:
+  the stripped state is transient, the pre-strip store is already on Drive, and the
+  post-ingest and post-re-apply pushes are the restore points). After the LAST source is verified: pcm-PubChem-runner
+  MODE=collect; then Claude reviews the names in
+  `lightrag\data\enrich_cache\collect_new_entities.json` that do NOT yet carry `by: claude-review` in
+  verify.json. The file holds the collected entities that had no verify.json entry when the collect STARTED,
+  PLUS names kept over from the previous file while still collected (already reviewed), so its printed count
+  overstates the work (2026-10-10: 326 listed, 1 new; 347 listed, 21 new). Selecting by "no verify.json
+  entry now" finds nothing, because the GLM verdict is written to verify.json during collect). Same-substance check; GLM verify
   alone is not enough for NEW entities. Record the verdicts as in plan Task 3 Step 4 (`same` true/false,
   `by: claude-review`, in verify.json); rejected ones go to EXCLUDE; then MODE=apply (re-adds blocks from the judge/verify/PubChem caches).
   Then `python lightrag\enrich_pubchem.py --scan-leaks` must exit 0. Exit 7 = leaked facts: clean them
