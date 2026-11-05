@@ -4659,6 +4659,13 @@ def fix_tuple_delimiter_corruption(
     # Escape the delimiter core for regex use
     escaped_delimiter_core = re.escape(delimiter_core)
 
+    # ragkit: whitespace inside the delimiter (<|# |>, <| #|>) -> <|#|>
+    record = re.sub(
+        rf"<\s*\|\s*{escaped_delimiter_core}\s*\|\s*>",
+        tuple_delimiter,
+        record,
+    )
+
     # Fix: <|##|> -> <|#|>, <|#||#|> -> <|#|>, <|#|||#|> -> <|#|>
     record = re.sub(
         rf"<\|{escaped_delimiter_core}\|*?{escaped_delimiter_core}\|>",

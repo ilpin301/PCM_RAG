@@ -48,3 +48,5 @@ _Cost-Effectiveness_and_Energy_Impact_of_Phase_Change_Materials_PCMs_in_Building
 _EFEKTIVITAS_DAN_EFISIENSI_PANEL_SURYA_BERBASIS_PENDINGINAN_PHOTOVOLTAIC_DENGAN_MATERIAL_PC.pdf  # 12 pp, ONE doc 2026-10-10 (doc-bfaa689651c53d160df3c9db04db9ba7), MinerU route, ingest.ps1 -Merged -Pages 6 (2 slices), 58 chunks, +543 nodes/+2530 edges; zero ERROR/RetryError, zero permanent loss
 Energy-Efficient_Phase-Change_Memory_with_Graphene_as_a_Thermal_Barrier.pdf  # 13 pp, ONE doc 2026-10-10 (doc-a6347f2b64febb6e829d46121a39d70a), Ahn et al. Nano Lett 2015, MinerU route, ingest.ps1 -Merged -Pages 7 (2 slices), 84 chunks, +853 nodes/+3577 edges; zero ERROR/RetryError, zero permanent loss
 Interface_controlled_thermal_properties_of_ultra-thin_chalcogenide-based_phase_change_memo.pdf
+Microstructure_characterization_phase_transition_and_device_application_of_phase-change_me.pdf  # 15 pp, ONE doc 2026-10-27 (doc-1416f9d3a35b4d957c20cd69870dadb9), Jiang et al. PCM review, MinerU route, ingest.ps1 -Merged -Pages 8, 137 chunks, +1471 nodes/+5904 edges; 8 transient z.ai 1302, zero RetryError, zero permanent loss
+Phase-Change_Memory_from_Molecular_Tellurides.pdf
