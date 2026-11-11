@@ -170,8 +170,8 @@ async def jev_same(client, name, facts, breaker=None, version=PROMPT_VERSION):
 
 
 def decide(p, lo, hi):
-    if not lo < hi:
-        raise ValueError(f"need lo < hi, got {lo}, {hi}")
+    if not (lo < hi and hi > 0.5):  # hi <= 0.5 would let a coin-flip p count as 'yes'
+        raise ValueError(f"need lo < hi and hi > 0.5, got {lo}, {hi}")
     if p is None:
         return "review"
     return "yes" if p >= hi else "no" if p <= lo else "review"
@@ -383,7 +383,7 @@ def _selftest():
         check(decide(0.2, 0.2, 0.8) == "no", "decide exactly lo -> no")
         check(decide(0.8, 0.2, 0.8) == "yes", "decide exactly hi -> yes")
         check(decide(None, 0.2, 0.8) == "review", "decide None -> review")
-        for lo, hi in ((0.8, 0.2), (0.5, 0.5)):
+        for lo, hi in ((0.8, 0.2), (0.5, 0.5), (0.2, 0.5), (0.1, 0.3)):  # hi must exceed 0.5
             try:
                 decide(0.5, lo, hi)
             except ValueError:

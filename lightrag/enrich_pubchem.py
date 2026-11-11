@@ -501,7 +501,7 @@ async def verify_match(client, name, facts, cache):
         if JEV_SHADOW:
             try:
                 await _jev_shadow_record(name, facts, same)
-            except (OSError, ValueError, httpx.HTTPError, KeyError, TypeError) as e:
+            except Exception as e:  # noqa: BLE001 - Jev must never abort an enrichment run
                 _jev_warn(f"{type(e).__name__}: {e}")
     return same
 
@@ -514,18 +514,21 @@ def _jev_warn(msg):
 
 
 def _jev_shadow_load():
+    """{} only when the file does not exist; an unreadable file raises, so the caller skips the write."""
     try:
         d = json.loads((CACHE_DIR / JEV_SHADOW_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        raise TypeError(f"{JEV_SHADOW_FILE} is not a JSON object")
+    return d
 
 
 async def _jev_shadow_record(name, facts, glm_same):
     """Store Jev's P(same substance) beside the GLM verdict in jev_shadow.json. Observation only."""
     try:
         import jev_verify  # lazy: with the flag off nothing is imported
-    except ImportError:
+    except Exception:  # noqa: BLE001 - Jev must never abort an enrichment run
         _jev_warn("jev_verify not importable")
         return
     if not jev_verify.BREAKER.allow():
@@ -1763,6 +1766,23 @@ async def _selftest_jev_shadow():
                 assert await verify_match(c, "E", fa(5), {}) is True
                 assert len(seen) == 5 and sum("jev-shadow" in x for x in logs) == 1, logs
                 assert "D" not in json.loads(f().read_text(encoding="utf-8"))
+                for i, exc in enumerate((RuntimeError("boom"), AttributeError("x"))):  # any error: verdict kept
+                    queue[:] = [exc]
+                    _JEV_WARNED = False
+                    logs.clear()
+                    assert await verify_match(c, f"F{i}", fa(10 + i), {}) is True
+                    assert sum("jev-shadow" in x for x in logs) == 1, logs
+                bad = b"\xff\xfe{not json"  # unreadable file: never replaced by a fresh one-entry dict
+                f().write_bytes(bad)
+                queue[:] = [0.9]
+                _JEV_WARNED = False
+                logs.clear()
+                assert await verify_match(c, "G", fa(7), {}) is True
+                assert f().read_bytes() == bad and sum("jev-shadow" in x for x in logs) == 1, logs
+                f().unlink()  # missing file: still created
+                queue[:] = [0.9]
+                assert await verify_match(c, "H", fa(8), {}) is True
+                assert json.loads(f().read_text(encoding="utf-8"))["H"]["p"] == 0.9
     finally:
         CACHE_DIR, JEV_SHADOW, _JEV_WARNED, log, jev_verify.jev_same, jev_verify.BREAKER = old[:6]
         _glm.clear()

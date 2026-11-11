@@ -9,6 +9,7 @@ Usage: python lightrag/jev_eval.py --selftest | --build-synthetic | --run | --re
 import argparse
 import asyncio
 import collections
+import io
 import itertools
 import json
 import math
@@ -476,6 +477,16 @@ def _selftest():
     check(e["false_accept"] == 0 and e["false_reject"] == 0 and e["n_none"] == 1, "None never counted")
     check(evaluate([{"same": False}], [0.1], 0.2, 0.9)["coverage"] == 0.0, "coverage 0.0 without trues")
 
+    # main rejects cut-offs decide() would refuse (exit 2, nothing runs)
+    for argv in (["--report", "--hi", "0.5"], ["--run", "--lo", "0.6", "--hi", "0.55"],
+                 ["--report", "--lo", "0.1", "--hi", "0.3"]):
+        sys.argv, saved, sys.stderr = ["jev_eval.py", *argv], sys.argv, io.StringIO()
+        try:
+            rc, msg = main(), sys.stderr.getvalue()
+        finally:
+            sys.argv, sys.stderr = saved, sys.__stderr__
+        check(rc == 2 and "--hi" in msg, f"main rejects {argv}")
+
     # upper_bound
     check(abs(upper_bound(0, 33) - 0.091) < 0.01 and abs(upper_bound(0, 33) - 0.087) < 0.001, "ub 0/33")
     check(abs(upper_bound(0, 100) - 0.030) < 0.01, "ub 0/100")
@@ -578,6 +589,9 @@ def main():
     ap.add_argument("--lo", type=float, default=0.2)
     ap.add_argument("--hi", type=float, default=None)
     a = ap.parse_args()
+    if a.hi is not None and not (a.lo < a.hi and a.hi > 0.5):
+        print(f"--hi must satisfy --lo < --hi and --hi > 0.5, got lo={a.lo} hi={a.hi}", file=sys.stderr)
+        return 2
     if a.selftest:
         _selftest()
         return 0
