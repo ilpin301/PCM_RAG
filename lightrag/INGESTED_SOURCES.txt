@@ -50,3 +50,4 @@ Energy-Efficient_Phase-Change_Memory_with_Graphene_as_a_Thermal_Barrier.pdf  # 1
 Interface_controlled_thermal_properties_of_ultra-thin_chalcogenide-based_phase_change_memo.pdf
 Microstructure_characterization_phase_transition_and_device_application_of_phase-change_me.pdf  # 15 pp, ONE doc 2026-10-27 (doc-1416f9d3a35b4d957c20cd69870dadb9), Jiang et al. PCM review, MinerU route, ingest.ps1 -Merged -Pages 8, 137 chunks, +1471 nodes/+5904 edges; 8 transient z.ai 1302, zero RetryError, zero permanent loss
 Phase-Change_Memory_from_Molecular_Tellurides.pdf
+Protocol_for_nanoscale_thermal_mapping_of_electronic_devices_using_atomic_force_microscopy.pdf  # 11 pp, ONE doc 2026-11-11 (doc-a68d66be71d11bb1878069b27cd8245b), MinerU route, ingest.ps1 -Merged -Pages 6 (2 slices), 43 chunks, +395 nodes/+1533 edges; one z.ai 1200s worker timeout on Figure 5 self-healed via individual fallback, 2 transient z.ai 1302, zero RetryError, zero permanent loss
