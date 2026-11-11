@@ -45,9 +45,8 @@ def build_state(name, facts):
     }
 
 
-def build_question():
-    return {"same": {
-        "type": "noul",
+QUESTION_TEXT = {
+    "v1": {
         "instructions": (
             "Decide whether the PubChem record (pubchem_iupac, pubchem_formula) is the SAME substance "
             "that entity_name denotes. Form words (Nanoparticles, Powder, Nanofluid, Nanowire, Flakes) "
@@ -55,11 +54,38 @@ def build_question():
             "the same (e.g. 'Graphene Oxide' vs methane CH4 -> not the same). If pubchem_iupac or "
             "pubchem_formula is '(none)' there is no evidence for a match."
         ),
-        "criteria": {
-            "true": "Same substance (form words ignored)",
-            "false": "Different compound, hydration state or composition, or no usable record",
-        },
-    }}
+        "true": "Same substance (form words ignored)",
+        "false": "Different compound, hydration state or composition, or no usable record",
+    },
+    "v2": {  # experimental, probed by jev_v2_probe.py
+        "instructions": (
+            "Decide whether entity_name unambiguously denotes exactly the one pure substance in the "
+            "PubChem record (pubchem_iupac, pubchem_formula), so that the record's properties (formula, "
+            "molar mass, melting point) may be attached to a knowledge-graph node named entity_name. "
+            "Form words (Nanoparticles, Powder, Nanofluid, Nanowire, Flakes) do not change the substance. "
+            "Answer false when any of these holds: the name denotes a different compound, hydration state "
+            "or composition; the name is a generic family or class, or does not fix the stoichiometry "
+            "(for example 'Manganese Oxide', 'Metal Hydride', 'Fatty Acid'); the name is an ambiguous "
+            "abbreviation, code or trade name that could stand for several substances; the name denotes "
+            "a mixture, solution, alloy or composite rather than one pure substance; the name denotes a "
+            "spectral line, an energy level, a single atom, an ion, a cluster, a slab or surface model, "
+            "or a physical state or phase (vapor, ice, liquid, amorphous) rather than the substance "
+            "itself; or the record is '(none)'."
+        ),
+        "true": "The name fixes exactly this one pure substance (form words ignored)",
+        "false": ("A different substance, or the name is generic or ambiguous, a mixture, a spectral "
+                  "line, atom, ion, cluster, slab, or a physical state rather than the substance itself, "
+                  "or there is no usable record"),
+    },
+}
+
+
+def build_question(version=PROMPT_VERSION):
+    t = QUESTION_TEXT.get(version)
+    if t is None:
+        raise ValueError(f"unknown prompt version {version!r}")
+    return {"same": {"type": "noul", "instructions": t["instructions"],
+                     "criteria": {"true": t["true"], "false": t["false"]}}}
 
 
 def parse_noul(body):
@@ -104,7 +130,7 @@ class JevBreaker:
 BREAKER = JevBreaker()
 
 
-async def jev_same(client, name, facts, breaker=None):
+async def jev_same(client, name, facts, breaker=None, version=PROMPT_VERSION):
     """P(PubChem record is the same substance as name), or None. Never raises."""
     breaker = breaker or BREAKER
     if not breaker.allow():
@@ -113,9 +139,9 @@ async def jev_same(client, name, facts, breaker=None):
     if not key:
         breaker.trip("no TYPESAFE_API_KEY")
         return None
-    payload = {"model": MODEL, "state": build_state(name, facts), "questions": build_question()}
     headers = {"Authorization": f"Bearer {key}"}
     try:
+        payload = {"model": MODEL, "state": build_state(name, facts), "questions": build_question(version)}
         for attempt in range(MAX_TRIES):
             async with _sem():
                 r = await client.post(f"{BASE_URL}/v1/systemone", json=payload, headers=headers,
@@ -153,6 +179,20 @@ def decide(p, lo, hi):
 
 # ------------------------------------------------------------------ selftest
 _N = 0
+_V1_FROZEN = {"same": {
+    "type": "noul",
+    "instructions": (
+        "Decide whether the PubChem record (pubchem_iupac, pubchem_formula) is the SAME substance "
+        "that entity_name denotes. Form words (Nanoparticles, Powder, Nanofluid, Nanowire, Flakes) "
+        "do not change the substance. A different compound, hydration state or composition is NOT "
+        "the same (e.g. 'Graphene Oxide' vs methane CH4 -> not the same). If pubchem_iupac or "
+        "pubchem_formula is '(none)' there is no evidence for a match."
+    ),
+    "criteria": {
+        "true": "Same substance (form words ignored)",
+        "false": "Different compound, hydration state or composition, or no usable record",
+    },
+}}
 
 
 def check(cond, msg):
@@ -202,6 +242,17 @@ async def _selftest_async():
         check(rq.headers["authorization"] == "Bearer test-key", "Bearer header")
         check(body["model"] == "jev-latest", "model alias in body")
         check(str(rq.url) == "https://api.typesafe.ai/v1/systemone", "endpoint url")
+
+    # version selects the question text; unknown version -> None, never raises
+    seen.clear()
+    async with _client(hseen) as c:
+        check(await jev_same(c, "X", facts, JevBreaker(), version="v2") == 0.93, "v2 call returns p")
+        check(await jev_same(c, "X", facts, JevBreaker()) == 0.93, "default call returns p")
+        n = len(seen)
+        check(await jev_same(c, "X", facts, JevBreaker(), version="v9") is None and len(seen) == n,
+              "unknown version -> None, no request")
+    check(json.loads(seen[0].content)["questions"] == build_question("v2"), "v2 question sent")
+    check(json.loads(seen[1].content)["questions"] == _V1_FROZEN, "default question sent is v1")
 
     # 401 -> None, tripped, next call makes no request
     reqs.clear()
@@ -303,6 +354,20 @@ def _selftest():
         check(s["pubchem_iupac"] == "oxidane" and s["pubchem_formula"] == "H2O", "facts pass through")
         q = build_question()["same"]
         check(q["type"] == "noul" and set(q["criteria"]) == {"true", "false"}, "question shape")
+        check(PROMPT_VERSION == "v1" and build_question() == build_question("v1") == _V1_FROZEN,
+              "v1 question byte-identical to frozen copy")
+        q2 = build_question("v2")["same"]
+        check(q2["type"] == "noul" and set(q2["criteria"]) == {"true", "false"}, "v2 question shape")
+        check(q2["instructions"].startswith("Decide whether entity_name unambiguously denotes exactly")
+              and q2["instructions"].endswith("or the record is '(none)'."), "v2 instructions")
+        check(q2["criteria"]["true"].startswith("The name fixes exactly this one pure substance"),
+              "v2 criteria true")
+        try:
+            build_question("v9")
+        except ValueError:
+            check(True, "unknown version raises")
+        else:
+            check(False, "unknown version must raise")
 
         good = {"answers": {"same": {"noul": 0.9}}}
         check(parse_noul(good) == 0.9, "parse good")
