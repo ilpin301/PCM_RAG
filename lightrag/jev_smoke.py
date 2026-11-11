@@ -47,7 +47,7 @@ def main() -> int:
                 j = r.json()
                 items = j.get("data", j) if isinstance(j, dict) else j
                 print(r.status_code, [m.get("id") for m in items])
-            except Exception:
+            except (ValueError, AttributeError, TypeError):
                 print(r.status_code)
         except httpx.HTTPError as e:
             print("models error", type(e).__name__)
