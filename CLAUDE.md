@@ -63,6 +63,16 @@
   ref_text nodes) can be absorbed into prose by an ingest just the same, there is no strip tool for
   them until OpenAlex Task 8 is run, so the post-ingest `--scan-leaks` (it matches the literal word
   OpenAlex too) is the only guard for them; exit 7 -> clean as in Task 4.
+- **Jev shadow on every post-ingest PubChem collect.** Run the collect with `--jev-shadow`
+  appended (`pcm-PubChem-runner` has no flag pass-through: write "append `--jev-shadow` to the
+  enrich_pubchem.py collect command" in its task prompt, or run the collect yourself). Jev
+  (TypeSafe `jev-latest`) only records its probability next to the GLM verdict in
+  `lightrag\data\enrich_cache\jev_shadow.json`; it never changes a verdict or the graph, and
+  Claude still reviews every new entity. After the Claude review, run
+  `python lightrag\jev_recalibrate.py` and report its STATUS line. Jev may skip Claude review
+  (option b) only after 100 reviewed GLM-yes entities, zero joint false accepts AND the user's
+  explicit OK; until then option (a) only (reorder the queue, never skip). Plan:
+  `docs/superpowers/plans/2026-11-11-jev-pubchem-verify.md`.
 
 ## This base
 - Server `pcm_rag-lightrag-1`, port 9622, `COMPOSE_PROJECT_NAME=pcm_rag` in `lightrag\.env`.
