@@ -28,6 +28,9 @@ USAGE:
   python enrich_pubchem.py --scan-leaks  # list descriptions with PubChem/OpenAlex facts outside the blocks
   python enrich_pubchem.py --max-glm-tokens 500000  # stop cleanly once GLM has used N tokens (0 = no cap)
   python enrich_pubchem.py --ignore-resume  # start although RESUME.json says a quota stop is still active
+  python enrich_pubchem.py --jev-shadow  # record Jev same-substance probability (prompt v2) in data/enrich_cache/jev_shadow.json
+                                      # next to the GLM verdict; never changes a verdict; needs TYPESAFE_API_KEY,
+                                      # missing key = one warning, run carries on
   python enrich_pubchem.py --selftest # offline asserts, no network, no graph
 
 EXIT CODES:
@@ -72,6 +75,10 @@ JUDGE_CACHE = CACHE_DIR / "judge.json"
 RESUME_FILE = "RESUME.json"  # under CACHE_DIR; written on a GLM quota/budget stop (exit 4)
 VERIFY_FILE = "verify.json"  # under CACHE_DIR; GLM same-substance verdicts per (name, CID)
 CID_LOOKUP_FILE = "cid_lookup.json"  # under CACHE_DIR; name -> CID replies, so an exit-5 re-run skips finished lookups
+JEV_SHADOW = False  # --jev-shadow: record TypeSafe Jev's p next to fresh GLM verdicts, never alters them
+JEV_SHADOW_FILE = "jev_shadow.json"  # under CACHE_DIR; {name: {cid, p, glm_same, model, pv}}
+JEV_SHADOW_PV = "v2"  # shadow uses prompt v2 (v1 over-accepts); jev_verify.PROMPT_VERSION is left alone
+_JEV_WARNED = False  # one jev-shadow warning per run
 NOTFOUND_CACHE_TTL_S = 7 * 86400  # a cached name not-found is trusted this long (PubChem adds compounds)
 FACTS_VERSION = 4  # 4: mp only from value-first strings / numbers; no majority of agreeing values -> not available
 
@@ -491,7 +498,52 @@ async def verify_match(client, name, facts, cache):
     if same is not None:
         cache[name] = {"cid": facts["cid"], "same": same}
         save_verify_cache(cache)
+        if JEV_SHADOW:
+            try:
+                await _jev_shadow_record(name, facts, same)
+            except (OSError, ValueError, httpx.HTTPError, KeyError, TypeError) as e:
+                _jev_warn(f"{type(e).__name__}: {e}")
     return same
+
+
+def _jev_warn(msg):
+    global _JEV_WARNED
+    if not _JEV_WARNED:
+        _JEV_WARNED = True
+        log(f"[jev-shadow] {msg}; shadow recording is best-effort, the run carries on")
+
+
+def _jev_shadow_load():
+    try:
+        d = json.loads((CACHE_DIR / JEV_SHADOW_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+async def _jev_shadow_record(name, facts, glm_same):
+    """Store Jev's P(same substance) beside the GLM verdict in jev_shadow.json. Observation only."""
+    try:
+        import jev_verify  # lazy: with the flag off nothing is imported
+    except ImportError:
+        _jev_warn("jev_verify not importable")
+        return
+    if not jev_verify.BREAKER.allow():
+        _jev_warn("Jev is off (breaker tripped)")
+        return
+    old = _jev_shadow_load().get(name)
+    if isinstance(old, dict) and old.get("cid") == facts["cid"] and old.get("pv") == JEV_SHADOW_PV:
+        return
+    # dedicated client: the z.ai client may carry z.ai auth headers, TypeSafe must only see its own Bearer token
+    async with httpx.AsyncClient(trust_env=False) as jc:
+        p = await jev_verify.jev_same(jc, name, facts, version=JEV_SHADOW_PV)
+    data = _jev_shadow_load()  # re-read: merge, never clobber
+    data[name] = {"cid": facts["cid"], "p": p, "glm_same": bool(glm_same),
+                  "model": jev_verify.MODEL, "pv": JEV_SHADOW_PV}
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE_DIR / (JEV_SHADOW_FILE + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, CACHE_DIR / JEV_SHADOW_FILE)
 
 
 async def judge_all(names, cache, refresh=False):
@@ -1653,6 +1705,66 @@ async def _selftest_verify():
             _glm.update(old_glm)
 
 
+async def _selftest_jev_shadow():
+    """--jev-shadow: records Jev p next to fresh GLM verdicts only; never changes a verdict; dedicated client."""
+    global CACHE_DIR, JEV_SHADOW, _JEV_WARNED, log
+    import tempfile
+
+    import jev_verify
+    seen, queue = [], []
+
+    async def stub(client, name, facts, breaker=None, version=None):
+        seen.append((client, name, version))
+        r = queue.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "YES"}}], "usage": {"total_tokens": 10}})
+
+    old = (CACHE_DIR, JEV_SHADOW, _JEV_WARNED, log, jev_verify.jev_same, jev_verify.BREAKER, dict(_glm))
+    logs = []
+    log = logs.append
+    jev_verify.jev_same = stub
+    _glm.update({"tokens": 0, "max": 0, "stop": None, "reset_at": None, "new": 0})
+    f = lambda: CACHE_DIR / JEV_SHADOW_FILE
+    fa = lambda cid: {"cid": cid, "formula": "H2O", "iupac": "oxidane"}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            CACHE_DIR = Path(tmp)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+                JEV_SHADOW = False  # off: no call, no file
+                assert await verify_match(c, "Water", fa(962), {}) is True
+                assert not seen and not f().exists()
+                JEV_SHADOW = True  # on: same verdict, p recorded (None -> null)
+                queue[:] = [0.91, None]
+                assert await verify_match(c, "A", fa(1), {}) is True
+                assert await verify_match(c, "B", fa(2), {}) is True
+                got = json.loads(f().read_text(encoding="utf-8"))
+                m = {"model": jev_verify.MODEL, "pv": "v2", "glm_same": True}
+                assert got == {"A": dict(m, cid=1, p=0.91), "B": dict(m, cid=2, p=None)}, got
+                assert [s[2] for s in seen] == ["v2", "v2"]
+                assert seen[0][0] is not c and isinstance(seen[0][0], httpx.AsyncClient)  # never the z.ai client
+                assert await verify_match(c, "A", fa(1), {}) is True  # same cid+pv on file: no second call
+                assert len(seen) == 2
+                jev_verify.BREAKER = jev_verify.JevBreaker()
+                jev_verify.BREAKER.trip("test")  # tripped: no call, verdict unchanged
+                assert await verify_match(c, "C", fa(3), {}) is True and len(seen) == 2
+                jev_verify.BREAKER = jev_verify.JevBreaker()
+                queue[:] = [httpx.ConnectError("down"), httpx.ConnectError("down")]
+                logs.clear()
+                _JEV_WARNED = False
+                assert await verify_match(c, "D", fa(4), {}) is True
+                assert await verify_match(c, "E", fa(5), {}) is True
+                assert len(seen) == 4 and sum("jev-shadow" in x for x in logs) == 1, logs
+                assert "D" not in json.loads(f().read_text(encoding="utf-8"))
+    finally:
+        CACHE_DIR, JEV_SHADOW, _JEV_WARNED, log, jev_verify.jev_same, jev_verify.BREAKER = old[:6]
+        _glm.clear()
+        _glm.update(old[6])
+
+
 def _selftest():
     global GRAPHML
     import tempfile
@@ -1790,6 +1902,7 @@ def _selftest():
     asyncio.run(_selftest_fetch())
     asyncio.run(_selftest_quota_stop())
     asyncio.run(_selftest_verify())
+    asyncio.run(_selftest_jev_shadow())
     asyncio.run(_selftest_breaker())
     print("selftest OK")
 
@@ -1813,9 +1926,14 @@ def main():
     ap.add_argument("--force", action="store_true", help="with --collect: overwrite an existing FILE")
     ap.add_argument("--strip-all", action="store_true",
                     help="with --fix-blocks --collect: strip EVERY PubChem block (before an ingest; re-add after)")
+    ap.add_argument("--jev-shadow", action="store_true",
+                    help="record Jev same-substance probability (prompt v2) in jev_shadow.json next to the GLM verdict; "
+                         "never changes a verdict; needs TYPESAFE_API_KEY (missing = one warning)")
     ap.add_argument("--scan-leaks", action="store_true",
                     help="list descriptions with PubChem/OpenAlex facts outside the blocks; exit 7 if any")
     args = ap.parse_args()
+    global JEV_SHADOW
+    JEV_SHADOW = args.jev_shadow
     if args.selftest:
         _selftest()
         return
