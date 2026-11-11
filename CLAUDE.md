@@ -6,25 +6,25 @@
   and only then start the next. Never batch several sources into one list file - a failure then
   cannot be attributed and the delete/re-ingest repair costs minutes per document. Slices of ONE
   source still go in ONE run. A failed or lossy source STOPS the queue; report and wait.
-- **After each source, `rag_sync.ps1 push` before the next one launches.** The per-source
+- **After each source, `rag_sync.ps1 push -WaitUpload` before the next one launches.** The per-source
   cleanup is not done until that push succeeds AND the cloud check below says VERIFIED. If `J:` is missing, Google Drive is not
   running - start `GoogleDriveFS.exe` (newest version folder under
   `C:\Program Files\Google\Drive File Stream` that contains it - not `Drivers`, which sorts last by name), wait for `J:\My Drive` to appear, then push.
   Native PowerShell only. A failed push stops the queue, same as a failed ingest.
+  `-WaitUpload` waits up to 1 h for the cloud upload: exit 0 = `rag_sync.ps1 status` confirmed the cloud upload, exit 4 = copied to `J:` but cloud NOT confirmed (keep keepawake and GoogleDriveFS on, stop the queue, report); run it as a background command (the foreground tool cap is 10 min) and read its exit code when the notification arrives.
 - **Start Google Drive at the START of a run** (not right before the push) so it warms up while the ingest
   runs. Before `rag_sync.ps1 push`, if `GoogleDriveFS` has been up < 5 min, wait until it has been up 5 min.
   Why: 2026-09-29 a cold-started Drive (~1 min before the push) made the `Copy-Item` overwrite of
   `rag_storage.tgz` on the streaming mount block >4 min while Drive fetched the old ~1 GB archive; warm
   pushes do not download. Evidence is correlation, cause not proven.
 - **keepawake runs from the start of the run until the backup is VERIFIED in Google's cloud.** Start
-  `lightrag\keepawake.ps1` before anything else; the push runs under it. `rag_sync.ps1 push` exit 0 only
-  means the archive reached the local `J:` mount, never call that "backed up". VERIFIED = the cloud
+  `lightrag\keepawake.ps1` before anything else; the push runs under it. A plain `rag_sync.ps1 push` (no `-WaitUpload`) exits 1 = PENDING right after copying to the local `J:` mount; never call that 'backed up' and never read the tool's 'completed' notice as backup done. With `-WaitUpload`, exit 0 still needs the independent cloud check below. VERIFIED = the cloud
   `rag_storage.tgz` in this base's Drive folder (Google Drive MCP, filter by the folder's `parentId`, one
   archive per base) has `fileSize` equal to the local file AND `modifiedTime` after the push started.
   Not yet: keep keepawake and GoogleDriveFS up, re-check every ~5 min, give up after 60 min and report.
   Only then stop keepawake and let the next source start (il-rag-ingest Step 8).
   Why: 2026-10-22 keepawake was stopped before the push; Windows slept mid-push (Kernel-Power 42, System
-  Idle), and "push OK" was reported while the cloud still held the previous day's archive.
+  Idle), and "push OK" was reported while the cloud still held the previous day's archive. 2026-11-11: a plain push exited 1 (PENDING) while the harness reported 'completed (exit code 0)' from the following command, so `-WaitUpload` is now mandatory.
 - Always launch ingests via the ragkit launcher, detached, never inline:
   `& $env:RAGKIT_HOME\ingest.ps1 -Root X:\RAG_MAIN\PCM_RAG -ListFile <utf8 list>`. It produces
   `lightrag\LOG\ingest_run.log`, which progress checks depend on, and it owns `docker compose`
