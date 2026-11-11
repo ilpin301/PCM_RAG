@@ -532,7 +532,8 @@ async def _jev_shadow_record(name, facts, glm_same):
         _jev_warn("Jev is off (breaker tripped)")
         return
     old = _jev_shadow_load().get(name)
-    if isinstance(old, dict) and old.get("cid") == facts["cid"] and old.get("pv") == JEV_SHADOW_PV:
+    if (isinstance(old, dict) and old.get("cid") == facts["cid"] and old.get("pv") == JEV_SHADOW_PV
+            and old.get("p") is not None):  # p=null = earlier failure: retry
         return
     # dedicated client: the z.ai client may carry z.ai auth headers, TypeSafe must only see its own Bearer token
     async with httpx.AsyncClient(trust_env=False) as jc:
@@ -1748,16 +1749,19 @@ async def _selftest_jev_shadow():
                 assert seen[0][0] is not c and isinstance(seen[0][0], httpx.AsyncClient)  # never the z.ai client
                 assert await verify_match(c, "A", fa(1), {}) is True  # same cid+pv on file: no second call
                 assert len(seen) == 2
+                queue[:] = [0.7]  # p=null on file (earlier failure): retried and overwritten
+                assert await verify_match(c, "B", fa(2), {}) is True and len(seen) == 3
+                assert json.loads(f().read_text(encoding="utf-8"))["B"]["p"] == 0.7
                 jev_verify.BREAKER = jev_verify.JevBreaker()
                 jev_verify.BREAKER.trip("test")  # tripped: no call, verdict unchanged
-                assert await verify_match(c, "C", fa(3), {}) is True and len(seen) == 2
+                assert await verify_match(c, "C", fa(3), {}) is True and len(seen) == 3
                 jev_verify.BREAKER = jev_verify.JevBreaker()
                 queue[:] = [httpx.ConnectError("down"), httpx.ConnectError("down")]
                 logs.clear()
                 _JEV_WARNED = False
                 assert await verify_match(c, "D", fa(4), {}) is True
                 assert await verify_match(c, "E", fa(5), {}) is True
-                assert len(seen) == 4 and sum("jev-shadow" in x for x in logs) == 1, logs
+                assert len(seen) == 5 and sum("jev-shadow" in x for x in logs) == 1, logs
                 assert "D" not in json.loads(f().read_text(encoding="utf-8"))
     finally:
         CACHE_DIR, JEV_SHADOW, _JEV_WARNED, log, jev_verify.jev_same, jev_verify.BREAKER = old[:6]
